@@ -6,4 +6,6 @@ openai==1.70.0
 mnemonic==0.21
 uvicorn==0.34.0
 pydantic==2.11.3
-redis==5.3.0
+redis==5.2.1
+cffi
+cryptography
