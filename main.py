@@ -2,19 +2,23 @@
 Forex & Memecoin Trading Bot
 ─────────────────────────────
 Dual-market autonomous trading platform:
-  - Forex: Technical analysis, AI-confirmed signals, paper/live execution via OANDA
+  - Forex: Technical analysis, AI-confirmed signals, paper/live execution via OANDA + MT5
   - Memecoin: DexScreener discovery, enhanced rug detection, Jupiter execution on Solana
   - Shared: Telegram alerts + approval flow, Redis state, unified dashboard
+  - Auto-scheduling: background loops run both markets on configurable intervals
 """
 
+import asyncio
 import json
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 from config.settings import (
     MEMECOIN_MIN_CONFIDENCE, FOREX_MIN_CONFIDENCE,
@@ -49,9 +53,8 @@ try:
     HAS_CODEWORDS = True
 except ImportError:
     import redis.asyncio as aioredis
-    from contextlib import asynccontextmanager
     logger = logging.getLogger("trading_bot")
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     HAS_CODEWORDS = False
 
     @asynccontextmanager
@@ -68,14 +71,92 @@ except ImportError:
         return {}
 
 
+# ── Background scheduler state ────────────────────────────────────
+_scheduler_tasks: list[asyncio.Task] = []
+_bot_started_at: str = ""
+
+
+async def _auto_memecoin_loop():
+    """Run memecoin cycles automatically every N minutes."""
+    interval = int(os.environ.get("MEMECOIN_INTERVAL_MINUTES", "20"))
+    paper = os.environ.get("MEMECOIN_LIVE", "").lower() != "true"
+    logger.info(f"Memecoin auto-loop started: every {interval}m, paper={paper}")
+    while True:
+        try:
+            req = MemecoinBotRequest(
+                paper_trading=paper,
+                approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
+                schedule_interval_minutes=interval,
+                register_schedule=False,
+            )
+            result = await run_memecoin_cycle(req)
+            logger.info(f"Memecoin auto-cycle done: {result.message}")
+        except Exception as e:
+            logger.error(f"Memecoin auto-cycle error: {e}")
+        await asyncio.sleep(interval * 60)
+
+
+async def _auto_forex_loop():
+    """Run forex cycles automatically every N minutes."""
+    interval = int(os.environ.get("FOREX_INTERVAL_MINUTES", "60"))
+    paper = os.environ.get("FOREX_LIVE", "").lower() != "true"
+    logger.info(f"Forex auto-loop started: every {interval}m, paper={paper}")
+    while True:
+        try:
+            req = ForexBotRequest(
+                paper_trading=paper,
+                approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
+                schedule_interval_minutes=interval,
+                register_schedule=False,
+            )
+            result = await run_forex_cycle(req)
+            logger.info(f"Forex auto-cycle done: {result.message}")
+        except Exception as e:
+            logger.error(f"Forex auto-cycle error: {e}")
+        await asyncio.sleep(interval * 60)
+
+
+async def _startup_notification():
+    """Send a Telegram notification when the bot starts."""
+    global _bot_started_at
+    _bot_started_at = now_iso()
+    async with httpx.AsyncClient(timeout=15) as http:
+        mc_live = os.environ.get("MEMECOIN_LIVE", "").lower() == "true"
+        fx_live = os.environ.get("FOREX_LIVE", "").lower() == "true"
+        msg = (
+            "Trading Bot Online\n\n"
+            f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
+            f"Forex: {'LIVE' if fx_live else 'PAPER'} mode\n"
+            f"Started: {_bot_started_at}\n\n"
+            "Type /status in this chat anytime to check positions."
+        )
+        await send_telegram(http, msg)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start background trading loops on server boot."""
+    auto_trade = os.environ.get("AUTO_TRADE", "true").lower() == "true"
+    if auto_trade:
+        _scheduler_tasks.append(asyncio.create_task(_auto_memecoin_loop()))
+        _scheduler_tasks.append(asyncio.create_task(_auto_forex_loop()))
+    asyncio.create_task(_startup_notification())
+    logger.info("Trading bot started, background loops active" if auto_trade else "Trading bot started, manual mode")
+    yield
+    for t in _scheduler_tasks:
+        t.cancel()
+
+
 app = FastAPI(
     title="Forex & Memecoin Trading Bot",
     description=(
         "Dual-market autonomous trading platform. "
         "Forex: AI-powered signal generation with technical analysis (RSI, MACD, EMA, BB, ATR, Stochastic, ADX). "
-        "Memecoin: DexScreener discovery with enhanced rug-pull protection and Jupiter execution on Solana."
+        "Memecoin: DexScreener discovery with enhanced rug-pull protection and Jupiter execution on Solana. "
+        "MT5 bridge: webhook endpoint for MetaTrader 5 Expert Advisors to fetch and execute signals."
     ),
-    version="3.0.0",
+    version="3.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -613,6 +694,104 @@ def _ttl_expired_check(created_at: str) -> bool:
         return (datetime.now(timezone.utc) - dt).total_seconds() > APPROVAL_TTL_SECONDS
     except Exception:
         return True
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HEALTH CHECK
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Railway / load balancers."""
+    redis_ok = False
+    try:
+        async with redis_client() as (redis, ns):
+            await redis.ping()
+            redis_ok = True
+    except Exception:
+        pass
+    return {
+        "status": "healthy",
+        "redis": redis_ok,
+        "started_at": _bot_started_at or None,
+        "version": app.version,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MT5 BRIDGE  –  webhook endpoints for MetaTrader 5 Expert Advisors
+# ══════════════════════════════════════════════════════════════════
+
+class MT5SignalRequest(BaseModel):
+    secret: str = Field(..., description="Shared secret for authentication")
+    action: str = Field("get_signals", description="get_signals | confirm_trade | get_status")
+    pair: str | None = None
+    trade_id: str | None = None
+    fill_price: float | None = None
+
+
+@app.post("/mt5/webhook")
+async def mt5_webhook(req: MT5SignalRequest):
+    """Endpoint for MT5 EA to fetch signals and report fills."""
+    expected = os.environ.get("MT5_SECRET", "")
+    if not expected or req.secret != expected:
+        return {"error": "unauthorized"}
+
+    if req.action == "get_signals":
+        async with redis_client() as (redis, ns):
+            _, _, positions = await load_forex_state(redis, ns)
+            pending = await load_forex_pending(redis, ns)
+            open_pairs = {p["pair"] for p in positions.values()}
+            available = []
+            for aid, sig in pending.items():
+                if sig["pair"] not in open_pairs:
+                    available.append({
+                        "id": aid,
+                        "pair": sig["pair"],
+                        "direction": sig["direction"],
+                        "entry_price": sig["entry_price"],
+                        "sl": sig["sl"],
+                        "tp": sig["tp"],
+                        "confidence": sig.get("confidence", 0),
+                        "lot_size": float(os.environ.get("FOREX_LOT_SIZE", "0.01")),
+                    })
+            return {"signals": available, "open_positions": len(positions)}
+
+    elif req.action == "confirm_trade":
+        if not req.trade_id:
+            return {"error": "trade_id required"}
+        async with httpx.AsyncClient(timeout=15) as http:
+            async with redis_client() as (redis, ns):
+                raw = await redis.hget(f"{ns}:fx:pending", req.trade_id)
+                if not raw:
+                    return {"error": "signal not found or already used"}
+                signal = json.loads(_dec(raw))
+                executor = ForexExecutor(http, redis, ns)
+                lot = float(os.environ.get("FOREX_LOT_SIZE", "0.01"))
+                position = await executor.open_position(signal, lot, paper_trading=False, leverage=100)
+                await redis.hdel(f"{ns}:fx:pending", req.trade_id)
+                if req.fill_price:
+                    signal["fill_price_mt5"] = req.fill_price
+                await send_telegram(http, f"[MT5] Opened {signal['pair']} {signal['direction']} @ {req.fill_price or signal['entry_price']:.5f}")
+                return {"status": "confirmed", "pair": signal["pair"]}
+
+    elif req.action == "get_status":
+        async with redis_client() as (redis, ns):
+            _, _, positions = await load_forex_state(redis, ns)
+            pos_list = []
+            for pid, p in positions.items():
+                pos_list.append({
+                    "id": pid,
+                    "pair": p["pair"],
+                    "direction": p["direction"],
+                    "entry_price": p["entry_price"],
+                    "sl": p["sl"],
+                    "tp": p["tp"],
+                    "unrealized_pnl": p.get("unrealized_pnl", 0),
+                })
+            return {"positions": pos_list}
+
+    return {"error": f"unknown action: {req.action}"}
 
 
 # ══════════════════════════════════════════════════════════════════
