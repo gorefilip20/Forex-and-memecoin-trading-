@@ -441,7 +441,7 @@ async def run_forex_cycle(req: ForexBotRequest):
 
 @app.post("/forex/analyze")
 async def forex_analyze(
-    pairs: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"],
+    pairs: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "BTC/USD"],
     timeframe: str = "1h",
     multi_timeframe: bool = True,
 ):
@@ -792,6 +792,46 @@ async def mt5_webhook(req: MT5SignalRequest):
             return {"positions": pos_list}
 
     return {"error": f"unknown action: {req.action}"}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BROWSER TRIGGERS  –  GET endpoints you can open in a browser
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/trigger/memecoin")
+async def trigger_memecoin():
+    """Run a memecoin discovery + trading cycle (browser-friendly)."""
+    paper = os.environ.get("MEMECOIN_LIVE", "").lower() != "true"
+    req = MemecoinBotRequest(
+        paper_trading=paper,
+        approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
+    )
+    result = await run_memecoin_cycle(req)
+    return {"triggered": "memecoin", "paper": paper, "message": result.message}
+
+
+@app.get("/trigger/forex")
+async def trigger_forex():
+    """Run a forex analysis + trading cycle (browser-friendly)."""
+    paper = os.environ.get("FOREX_LIVE", "").lower() != "true"
+    req = ForexBotRequest(
+        paper_trading=paper,
+        approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
+    )
+    result = await run_forex_cycle(req)
+    return {"triggered": "forex", "paper": paper, "message": result.message}
+
+
+@app.get("/trigger/analyze/{pair}")
+async def trigger_analyze_pair(pair: str):
+    """Analyze a single pair and send signal to Telegram (browser-friendly)."""
+    async with httpx.AsyncClient(timeout=25) as http:
+        generator = ForexSignalGenerator(http)
+        signal = await generator.analyze_pair(pair, "1h", multi_timeframe=True)
+        if signal and signal.get("confidence", 0) > 0:
+            await send_forex_signal(http, signal)
+            return {"pair": pair, "signal": signal, "telegram": "sent"}
+        return {"pair": pair, "signal": signal, "telegram": "no signal met threshold"}
 
 
 # ══════════════════════════════════════════════════════════════════

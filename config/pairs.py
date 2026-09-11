@@ -25,6 +25,10 @@ FOREX_PAIRS = {
         {"symbol": "XAU/USD", "pip_value": 0.01, "spread_avg": 3.0, "description": "Gold / US Dollar"},
         {"symbol": "XAG/USD", "pip_value": 0.001, "spread_avg": 2.5, "description": "Silver / US Dollar"},
     ],
+    "crypto": [
+        {"symbol": "BTC/USD", "pip_value": 0.01, "spread_avg": 5.0, "description": "Bitcoin / US Dollar"},
+        {"symbol": "ETH/USD", "pip_value": 0.01, "spread_avg": 3.0, "description": "Ethereum / US Dollar"},
+    ],
 }
 
 CRYPTO_WATCHLIST = [
