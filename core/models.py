@@ -14,9 +14,9 @@ class MemecoinBotRequest(BaseModel):
     max_positions: int = Field(3, ge=1, le=MEMECOIN_MAX_OPEN_POSITIONS)
     per_trade_usd: float = Field(2.0, gt=0, le=10000.0)
     paper_starting_usd: float = Field(1000.0, gt=0)
-    min_liquidity_usd: float = Field(100000.0, ge=0)
-    min_volume_24h: float = Field(500000.0, ge=0)
-    max_age_hours: int = Field(72, ge=1, le=168)
+    min_liquidity_usd: float = Field(30000.0, ge=0)
+    min_volume_24h: float = Field(50000.0, ge=0)
+    max_age_hours: int = Field(120, ge=1, le=336)
     slippage_bps: int = Field(700, ge=50, le=2000)
     schedule_interval_minutes: int = Field(20, ge=1, le=1440)
     register_schedule: bool = Field(True)
@@ -46,7 +46,7 @@ class ForexBotRequest(BaseModel):
     paper_trading: bool = Field(True, description="True = simulate, False = live broker execution")
     approve_first: bool = Field(False, description="Require Telegram approval before each trade")
     pairs: list[str] = Field(
-        default=["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"],
+        default=["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "BTC/USD"],
         description="Forex pairs to monitor"
     )
     timeframe: str = Field("1h", description="Analysis timeframe: 5m, 15m, 30m, 1h, 4h, 1d")

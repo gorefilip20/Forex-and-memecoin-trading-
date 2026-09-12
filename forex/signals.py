@@ -47,7 +47,7 @@ class ForexSignalGenerator:
         for pair in pairs:
             try:
                 signal = await self.analyze_pair(pair, timeframe, multi_tf)
-                if signal and signal["confidence"] >= FOREX_MIN_CONFIDENCE:
+                if signal and signal["confidence"] >= 40:
                     signals.append(signal)
             except Exception as e:
                 logger.warning(f"Failed to analyze {pair}: {e}")

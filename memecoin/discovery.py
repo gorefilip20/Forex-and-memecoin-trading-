@@ -43,29 +43,81 @@ async def fetch_token_price_usd(http: httpx.AsyncClient, mint: str) -> Optional[
         return None
 
 
+async def _fetch_solana_mints_from_endpoint(http: httpx.AsyncClient, url: str) -> list[str]:
+    """Fetch Solana token mints from a DexScreener endpoint."""
+    try:
+        r = await http.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return [
+                p.get("tokenAddress")
+                for p in data
+                if p.get("chainId") == "solana" and p.get("tokenAddress")
+            ]
+    except Exception as e:
+        logger.warning(f"DexScreener fetch failed for {url}: {e}")
+    return []
+
+
+async def _fetch_trending_solana(http: httpx.AsyncClient) -> list[str]:
+    """Fetch trending Solana pairs from DexScreener search."""
+    try:
+        r = await http.get(
+            f"{DEXSCREENER_BASE}/latest/dex/search",
+            params={"q": "SOL"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        pairs = r.json().get("pairs", [])
+        mints = []
+        for p in pairs:
+            if p.get("chainId") == "solana":
+                base = p.get("baseToken", {})
+                addr = base.get("address")
+                if addr and addr != SOL_MINT:
+                    mints.append(addr)
+        return mints
+    except Exception as e:
+        logger.warning(f"Trending fetch failed: {e}")
+        return []
+
+
 async def discover_candidates(
     http: httpx.AsyncClient,
     min_liquidity: float,
     min_volume: float,
     max_age_hours: int,
 ) -> list[dict]:
-    """Discover and rank memecoin candidates from DexScreener."""
-    try:
-        r = await http.get(f"{DEXSCREENER_BASE}/token-profiles/latest/v1", timeout=20)
-        r.raise_for_status()
-        profiles = r.json()
-    except Exception as e:
-        logger.warning(f"Token profile fetch failed: {e}")
+    """Discover and rank memecoin candidates from multiple DexScreener sources."""
+    all_mints: list[str] = []
+
+    profiles = await _fetch_solana_mints_from_endpoint(
+        http, f"{DEXSCREENER_BASE}/token-profiles/latest/v1"
+    )
+    all_mints.extend(profiles)
+
+    boosts = await _fetch_solana_mints_from_endpoint(
+        http, f"{DEXSCREENER_BASE}/token-boosts/latest/v1"
+    )
+    all_mints.extend(boosts)
+
+    trending = await _fetch_trending_solana(http)
+    all_mints.extend(trending)
+
+    seen: set[str] = set()
+    solana_mints: list[str] = []
+    for m in all_mints:
+        if m and m not in seen:
+            seen.add(m)
+            solana_mints.append(m)
+
+    solana_mints = solana_mints[:60]
+    if not solana_mints:
+        logger.warning("No Solana mints found from any DexScreener source")
         return []
 
-    solana_mints = [
-        p.get("tokenAddress")
-        for p in profiles
-        if p.get("chainId") == "solana" and p.get("tokenAddress")
-    ]
-    solana_mints = solana_mints[:40]
-    if not solana_mints:
-        return []
+    logger.info(f"Discovery: {len(profiles)} profiles, {len(boosts)} boosts, {len(trending)} trending = {len(solana_mints)} unique mints")
 
     candidates: list[dict] = []
     now_s = int(time.time())

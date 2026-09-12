@@ -76,11 +76,30 @@ _scheduler_tasks: list[asyncio.Task] = []
 _bot_started_at: str = ""
 
 
+async def _notify_error(msg: str):
+    """Send error notification to Telegram so the user knows what broke."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            await send_telegram(http, f"[BOT ERROR] {msg}")
+    except Exception:
+        pass
+
+
+async def _notify_cycle(msg: str):
+    """Send cycle status to Telegram."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            await send_telegram(http, msg)
+    except Exception:
+        pass
+
+
 async def _auto_memecoin_loop():
     """Run memecoin cycles automatically every N minutes."""
-    interval = int(os.environ.get("MEMECOIN_INTERVAL_MINUTES", "20"))
+    interval = int(os.environ.get("MEMECOIN_INTERVAL_MINUTES", "15"))
     paper = os.environ.get("MEMECOIN_LIVE", "").lower() != "true"
-    logger.info(f"Memecoin auto-loop started: every {interval}m, paper={paper}")
+    await asyncio.sleep(30)
+    await _notify_cycle(f"[AUTO] Memecoin loop active: every {interval}m, {'PAPER' if paper else 'LIVE'}")
     while True:
         try:
             req = MemecoinBotRequest(
@@ -88,11 +107,17 @@ async def _auto_memecoin_loop():
                 approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
                 schedule_interval_minutes=interval,
                 register_schedule=False,
+                min_liquidity_usd=30000,
+                min_volume_24h=50000,
+                max_age_hours=120,
             )
             result = await run_memecoin_cycle(req)
             logger.info(f"Memecoin auto-cycle done: {result.message}")
+            if result.candidates_found == 0:
+                await _notify_cycle(f"[SCAN] Memecoin: 0 candidates found this cycle. Next scan in {interval}m.")
         except Exception as e:
             logger.error(f"Memecoin auto-cycle error: {e}")
+            await _notify_error(f"Memecoin cycle crashed: {e}")
         await asyncio.sleep(interval * 60)
 
 
@@ -100,19 +125,30 @@ async def _auto_forex_loop():
     """Run forex cycles automatically every N minutes."""
     interval = int(os.environ.get("FOREX_INTERVAL_MINUTES", "60"))
     paper = os.environ.get("FOREX_LIVE", "").lower() != "true"
-    logger.info(f"Forex auto-loop started: every {interval}m, paper={paper}")
+    await asyncio.sleep(60)
+    await _notify_cycle(f"[AUTO] Forex loop active: every {interval}m, {'PAPER' if paper else 'LIVE'}")
     while True:
         try:
+            fx_pairs = ["EUR/USD", "GBP/USD", "XAU/USD", "BTC/USD", "USD/JPY"]
             req = ForexBotRequest(
                 paper_trading=paper,
                 approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
+                pairs=fx_pairs,
                 schedule_interval_minutes=interval,
                 register_schedule=False,
+                multi_timeframe=False,
             )
             result = await run_forex_cycle(req)
             logger.info(f"Forex auto-cycle done: {result.message}")
+            await _notify_cycle(
+                f"[SCAN] Forex: {result.pairs_analyzed} pairs, "
+                f"{result.signals_generated} signals, "
+                f"{result.trades_executed} trades. "
+                f"Next scan in {interval}m."
+            )
         except Exception as e:
             logger.error(f"Forex auto-cycle error: {e}")
+            await _notify_error(f"Forex cycle crashed: {e}")
         await asyncio.sleep(interval * 60)
 
 
