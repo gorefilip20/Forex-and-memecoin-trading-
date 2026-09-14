@@ -96,3 +96,7 @@ The API will be available at `http://localhost:8000`. Docs at `/docs`.
 ## Risk Warning
 
 This bot does not guarantee profit. Forex and memecoins are both high-risk markets. The bot includes paper trading mode so you can test strategies without real money. Only trade with funds you can afford to lose. Stop-loss checks only run each cycle, so fast moves can fill well past the stop.
+
+## Daily Telegram Signals
+
+Set `DAILY_SIGNALS=true` to run a once-daily, paper-only scan and send qualified forex setups to `TELEGRAM_CHAT_ID`. Each signal includes direction, entry, stop-loss, take-profit, risk/reward, confidence, timeframe, and indicator context. The signal loop never enables live execution and does not place orders. Set `DAILY_SIGNAL_INTERVAL_MINUTES`, `SIGNAL_TIMEFRAME`, and `SIGNAL_PAIRS` to adjust the delivery schedule and watchlist.

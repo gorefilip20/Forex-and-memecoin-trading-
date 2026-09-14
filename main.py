@@ -9,6 +9,7 @@ Dual-market autonomous trading platform:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from config.settings import (
@@ -76,6 +77,24 @@ _scheduler_tasks: list[asyncio.Task] = []
 _bot_started_at: str = ""
 
 
+def _require_control_secret(token: str | None) -> None:
+    """Require an explicit control token for externally-triggered writes."""
+    expected = (os.environ.get("CONTROL_API_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="CONTROL_API_SECRET is not configured")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _enforce_execution_mode(paper_trading: bool) -> None:
+    """Prevent request bodies from turning on live trading accidentally."""
+    if not paper_trading and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="live trading is locked; set LIVE_TRADING_UNLOCK=true only after independent review",
+        )
+
+
 async def _notify_error(msg: str):
     """Send error notification to Telegram so the user knows what broke."""
     try:
@@ -97,7 +116,10 @@ async def _notify_cycle(msg: str):
 async def _auto_memecoin_loop():
     """Run memecoin cycles automatically every N minutes."""
     interval = int(os.environ.get("MEMECOIN_INTERVAL_MINUTES", "15"))
-    paper = os.environ.get("MEMECOIN_LIVE", "").lower() != "true"
+    paper = not (
+        os.environ.get("MEMECOIN_LIVE", "").lower() == "true"
+        and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+    )
     await asyncio.sleep(30)
     await _notify_cycle(f"[AUTO] Memecoin loop active: every {interval}m, {'PAPER' if paper else 'LIVE'}")
     while True:
@@ -124,7 +146,10 @@ async def _auto_memecoin_loop():
 async def _auto_forex_loop():
     """Run forex cycles automatically every N minutes."""
     interval = int(os.environ.get("FOREX_INTERVAL_MINUTES", "60"))
-    paper = os.environ.get("FOREX_LIVE", "").lower() != "true"
+    paper = not (
+        os.environ.get("FOREX_LIVE", "").lower() == "true"
+        and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+    )
     await asyncio.sleep(60)
     await _notify_cycle(f"[AUTO] Forex loop active: every {interval}m, {'PAPER' if paper else 'LIVE'}")
     while True:
@@ -152,13 +177,62 @@ async def _auto_forex_loop():
         await asyncio.sleep(interval * 60)
 
 
+async def _daily_signal_loop():
+    """Send one daily paper-only forex signal scan to Telegram."""
+    interval = max(60, int(os.environ.get("DAILY_SIGNAL_INTERVAL_MINUTES", "1440")))
+    pairs = [
+        p.strip()
+        for p in os.environ.get(
+            "SIGNAL_PAIRS", "EUR/USD,GBP/USD,USD/JPY,AUD/USD"
+        ).split(",")
+        if p.strip()
+    ]
+    await asyncio.sleep(30)
+    while True:
+        try:
+            req = ForexBotRequest(
+                paper_trading=True,
+                approve_first=False,
+                pairs=pairs,
+                timeframe=os.environ.get("SIGNAL_TIMEFRAME", "1h"),
+                max_positions=1,
+                register_schedule=False,
+                multi_timeframe=True,
+                signal_only=True,
+            )
+            result = await run_forex_cycle(req)
+            if result.signals_generated == 0:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await send_telegram(
+                        http,
+                        "DAILY MARKET SCAN\n\n"
+                        "No qualified forex setup met the bot's filters today. "
+                        "No trade is recommended.",
+                    )
+            logger.info(
+                "Daily signal scan complete: %s signals from %s pairs",
+                result.signals_generated,
+                result.pairs_analyzed,
+            )
+        except Exception as e:
+            logger.error(f"Daily signal scan error: {e}")
+            await _notify_error(f"Daily signal scan failed: {e}")
+        await asyncio.sleep(interval * 60)
+
+
 async def _startup_notification():
     """Send a Telegram notification when the bot starts."""
     global _bot_started_at
     _bot_started_at = now_iso()
     async with httpx.AsyncClient(timeout=15) as http:
-        mc_live = os.environ.get("MEMECOIN_LIVE", "").lower() == "true"
-        fx_live = os.environ.get("FOREX_LIVE", "").lower() == "true"
+        mc_live = (
+            os.environ.get("MEMECOIN_LIVE", "").lower() == "true"
+            and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+        )
+        fx_live = (
+            os.environ.get("FOREX_LIVE", "").lower() == "true"
+            and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+        )
         msg = (
             "Trading Bot Online\n\n"
             f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
@@ -172,10 +246,12 @@ async def _startup_notification():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background trading loops on server boot."""
-    auto_trade = os.environ.get("AUTO_TRADE", "true").lower() == "true"
+    auto_trade = os.environ.get("AUTO_TRADE", "false").lower() == "true"
     if auto_trade:
         _scheduler_tasks.append(asyncio.create_task(_auto_memecoin_loop()))
         _scheduler_tasks.append(asyncio.create_task(_auto_forex_loop()))
+    if os.environ.get("DAILY_SIGNALS", "false").lower() == "true":
+        _scheduler_tasks.append(asyncio.create_task(_daily_signal_loop()))
     asyncio.create_task(_startup_notification())
     logger.info("Trading bot started, background loops active" if auto_trade else "Trading bot started, manual mode")
     yield
@@ -201,8 +277,18 @@ app = FastAPI(
 # ══════════════════════════════════════════════════════════════════
 
 @app.post("/memecoin", response_model=MemecoinCycleResponse)
+async def memecoin_endpoint(
+    req: MemecoinBotRequest,
+    x_control_token: str | None = Header(default=None),
+):
+    """Authenticated HTTP entry point for a memecoin cycle."""
+    _require_control_secret(x_control_token)
+    return await run_memecoin_cycle(req)
+
+
 async def run_memecoin_cycle(req: MemecoinBotRequest):
-    """Run a memecoin discovery + trading cycle."""
+    """Run a memecoin discovery + trading cycle internally."""
+    _enforce_execution_mode(req.paper_trading)
     logger.info("Memecoin cycle start", paper=req.paper_trading)
     cycle_time = now_iso()
     entries, exits, decisions = [], [], []
@@ -342,8 +428,18 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
 # ══════════════════════════════════════════════════════════════════
 
 @app.post("/forex", response_model=ForexCycleResponse)
+async def forex_endpoint(
+    req: ForexBotRequest,
+    x_control_token: str | None = Header(default=None),
+):
+    """Authenticated HTTP entry point for a forex cycle."""
+    _require_control_secret(x_control_token)
+    return await run_forex_cycle(req)
+
+
 async def run_forex_cycle(req: ForexBotRequest):
-    """Run a forex analysis + signal + trading cycle."""
+    """Run a forex analysis + signal + trading cycle internally."""
+    _enforce_execution_mode(req.paper_trading)
     logger.info("Forex cycle start", paper=req.paper_trading, pairs=req.pairs)
     cycle_time = now_iso()
     signals_out = []
@@ -429,6 +525,9 @@ async def run_forex_cycle(req: ForexBotRequest):
 
                 if await send_forex_signal(http, signal):
                     alerts_sent += 1
+
+                if req.signal_only:
+                    continue
 
                 if req.approve_first:
                     aid = uuid.uuid4().hex[:10]
@@ -570,8 +669,9 @@ async def dashboard():
 
 
 @app.post("/reset", response_model=ResetResponse)
-async def reset():
+async def reset(x_control_token: str | None = Header(default=None)):
     """Reset all state (paper balances, positions, logs)."""
+    _require_control_secret(x_control_token)
     async with redis_client() as (redis, ns):
         for key_suffix in (
             "mc:balance_usd", "mc:positions", "mc:pending", "mc:cooldowns",
@@ -770,7 +870,7 @@ class MT5SignalRequest(BaseModel):
 async def mt5_webhook(req: MT5SignalRequest):
     """Endpoint for MT5 EA to fetch signals and report fills."""
     expected = os.environ.get("MT5_SECRET", "")
-    if not expected or req.secret != expected:
+    if not expected or not hmac.compare_digest(req.secret, expected):
         return {"error": "unauthorized"}
 
     if req.action == "get_signals":
@@ -794,6 +894,8 @@ async def mt5_webhook(req: MT5SignalRequest):
             return {"signals": available, "open_positions": len(positions)}
 
     elif req.action == "confirm_trade":
+        if os.environ.get("LIVE_TRADING_UNLOCK", "").lower() != "true":
+            return {"error": "live trading is locked"}
         if not req.trade_id:
             return {"error": "trade_id required"}
         async with httpx.AsyncClient(timeout=15) as http:
@@ -835,9 +937,13 @@ async def mt5_webhook(req: MT5SignalRequest):
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/trigger/memecoin")
-async def trigger_memecoin():
+async def trigger_memecoin(x_control_token: str | None = Header(default=None)):
     """Run a memecoin discovery + trading cycle (browser-friendly)."""
-    paper = os.environ.get("MEMECOIN_LIVE", "").lower() != "true"
+    _require_control_secret(x_control_token)
+    paper = not (
+        os.environ.get("MEMECOIN_LIVE", "").lower() == "true"
+        and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+    )
     req = MemecoinBotRequest(
         paper_trading=paper,
         approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
@@ -847,9 +953,13 @@ async def trigger_memecoin():
 
 
 @app.get("/trigger/forex")
-async def trigger_forex():
+async def trigger_forex(x_control_token: str | None = Header(default=None)):
     """Run a forex analysis + trading cycle (browser-friendly)."""
-    paper = os.environ.get("FOREX_LIVE", "").lower() != "true"
+    _require_control_secret(x_control_token)
+    paper = not (
+        os.environ.get("FOREX_LIVE", "").lower() == "true"
+        and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
+    )
     req = ForexBotRequest(
         paper_trading=paper,
         approve_first=os.environ.get("APPROVE_FIRST", "").lower() == "true",
@@ -859,8 +969,9 @@ async def trigger_forex():
 
 
 @app.get("/trigger/analyze/{pair}")
-async def trigger_analyze_pair(pair: str):
+async def trigger_analyze_pair(pair: str, x_control_token: str | None = Header(default=None)):
     """Analyze a single pair and send signal to Telegram (browser-friendly)."""
+    _require_control_secret(x_control_token)
     async with httpx.AsyncClient(timeout=25) as http:
         generator = ForexSignalGenerator(http)
         signal = await generator.analyze_pair(pair, "1h", multi_timeframe=True)
@@ -875,8 +986,9 @@ async def trigger_analyze_pair(pair: str):
 # ══════════════════════════════════════════════════════════════════
 
 @app.post("/")
-async def legacy_run(req: MemecoinBotRequest):
+async def legacy_run(req: MemecoinBotRequest, x_control_token: str | None = Header(default=None)):
     """Backward-compatible endpoint that runs the memecoin cycle."""
+    _require_control_secret(x_control_token)
     return await run_memecoin_cycle(req)
 
 

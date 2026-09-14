@@ -58,6 +58,7 @@ class ForexBotRequest(BaseModel):
     schedule_interval_minutes: int = Field(60, ge=1, le=1440)
     register_schedule: bool = Field(True)
     multi_timeframe: bool = Field(True, description="Use multi-timeframe analysis for stronger signals")
+    signal_only: bool = Field(False, description="Send qualified signals without opening paper or live positions")
 
 
 class ForexSignal(BaseModel):

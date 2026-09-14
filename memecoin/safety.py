@@ -69,9 +69,9 @@ async def enhanced_rug_check(http: httpx.AsyncClient, mint: str) -> dict:
     holder_info = await _check_holder_distribution(http, mint)
     details["holders"] = holder_info
 
-    if holder_info.get("total_holders", 0) < RUG_MIN_HOLDERS:
-        reasons.append(f"too few holders ({holder_info.get('total_holders', 0)} < {RUG_MIN_HOLDERS})")
-        score -= 25
+    # getTokenLargestAccounts returns only a capped largest-account sample,
+    # not the total holder population. Do not apply a holder-count threshold
+    # to that sample; doing so falsely rejects eligible tokens.
 
     if holder_info.get("top_holder_pct", 0) > RUG_MAX_TOP_HOLDER_PCT:
         reasons.append(f"top holder owns {holder_info['top_holder_pct']:.1f}% (> {RUG_MAX_TOP_HOLDER_PCT}%)")
@@ -125,7 +125,7 @@ async def _check_holder_distribution(http: httpx.AsyncClient, mint: str) -> dict
         accounts = r.json().get("result", {}).get("value", [])
 
         if not accounts:
-            return {"total_holders": 0, "top_holder_pct": 0, "top5_combined_pct": 0}
+            return {"holder_count_known": False, "top_holder_pct": 0, "top5_combined_pct": 0}
 
         amounts = []
         for acct in accounts:
@@ -154,14 +154,15 @@ async def _check_holder_distribution(http: httpx.AsyncClient, mint: str) -> dict
             top5_pct = sum(amounts[:5]) / total_supply * 100 if amounts else 0
 
         return {
-            "total_holders": len(accounts),
+            "holder_count_known": False,
+            "largest_accounts_sample": len(accounts),
             "top_holder_pct": round(top_holder_pct, 2),
             "top5_combined_pct": round(top5_pct, 2),
             "largest_accounts": len(accounts),
         }
     except Exception as e:
         logger.warning(f"Holder distribution check failed for {mint}: {e}")
-        return {"total_holders": 0, "top_holder_pct": 0, "top5_combined_pct": 0, "error": str(e)}
+        return {"holder_count_known": False, "top_holder_pct": 0, "top5_combined_pct": 0, "error": str(e)}
 
 
 async def _check_supply(http: httpx.AsyncClient, mint: str) -> dict:
