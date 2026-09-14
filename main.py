@@ -292,7 +292,7 @@ async def memecoin_endpoint(
 async def run_memecoin_cycle(req: MemecoinBotRequest):
     """Run a memecoin discovery + trading cycle internally."""
     _enforce_execution_mode(req.paper_trading)
-    logger.info("Memecoin cycle start", paper=req.paper_trading)
+    logger.info(f"Memecoin cycle start; paper={req.paper_trading}")
     cycle_time = now_iso()
     entries, exits, decisions = [], [], []
     approvals_processed = 0
@@ -317,7 +317,7 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
             candidates = await discover_candidates(
                 http, req.min_liquidity_usd, req.min_volume_24h, req.max_age_hours,
             )
-            logger.info("Memecoin candidates found", count=len(candidates))
+            logger.info(f"Memecoin candidates found; count={len(candidates)}")
 
             open_mints = set(positions.keys())
             pending = await load_memecoin_pending(redis, ns)
@@ -363,7 +363,10 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                     safety = await check_token_safety(http, mint)
 
                 if not safety["ok"]:
-                    logger.warning("Token blocked", mint=mint, symbol=cand["symbol"], reasons=safety["reasons"])
+                    logger.warning(
+                        f"Token blocked; mint={mint}; symbol={cand['symbol']}; "
+                        f"reasons={safety['reasons']}"
+                    )
                     rugs_blocked += 1
                     if await send_telegram(http, f"[BLOCKED] {cand['symbol']}: {'; '.join(safety['reasons'])}"):
                         alerts_sent += 1
@@ -443,7 +446,7 @@ async def forex_endpoint(
 async def run_forex_cycle(req: ForexBotRequest):
     """Run a forex analysis + signal + trading cycle internally."""
     _enforce_execution_mode(req.paper_trading)
-    logger.info("Forex cycle start", paper=req.paper_trading, pairs=req.pairs)
+    logger.info(f"Forex cycle start; paper={req.paper_trading}; pairs={req.pairs}")
     cycle_time = now_iso()
     signals_out = []
     trades_executed = 0
@@ -475,7 +478,7 @@ async def run_forex_cycle(req: ForexBotRequest):
 
             signal_gen = ForexSignalGenerator(http)
             raw_signals = await signal_gen.scan_pairs(req.pairs, req.timeframe, req.multi_timeframe)
-            logger.info("Forex signals generated", count=len(raw_signals))
+            logger.info(f"Forex signals generated; count={len(raw_signals)}")
 
             open_pairs = {p.get("pair") for p in positions.values()}
             pending = await load_forex_pending(redis, ns)
