@@ -36,6 +36,7 @@ Dual-market autonomous trading platform that handles both **forex** and **Solana
 | POST | `/forex/analyze/{pair}` | Deep analysis of a single pair |
 | GET | `/status` | Full status of both markets |
 | GET | `/dashboard` | Combined dashboard with stats |
+| GET | `/trigger/daily-signal` | Authenticated signal-only scan that sends qualified setups to Telegram |
 | POST | `/reset` | Reset all state to defaults |
 | POST | `/` | Legacy endpoint (runs memecoin cycle) |
 

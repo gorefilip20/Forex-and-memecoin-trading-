@@ -237,8 +237,11 @@ async def _startup_notification():
             "Trading Bot Online\n\n"
             f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
             f"Forex: {'LIVE' if fx_live else 'PAPER'} mode\n"
+            f"Daily signals: {'ON' if os.environ.get('DAILY_SIGNALS', '').lower() == 'true' else 'OFF'}\n"
+            f"Telegram configured: {'YES' if os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID') else 'NO'}\n"
             f"Started: {_bot_started_at}\n\n"
-            "Type /status in this chat anytime to check positions."
+            "Type /status in this chat anytime to check positions.\n"
+            "Signals are informational only; verify price before acting."
         )
         await send_telegram(http, msg)
 
@@ -966,6 +969,35 @@ async def trigger_forex(x_control_token: str | None = Header(default=None)):
     )
     result = await run_forex_cycle(req)
     return {"triggered": "forex", "paper": paper, "message": result.message}
+
+
+@app.get("/trigger/daily-signal")
+async def trigger_daily_signal(x_control_token: str | None = Header(default=None)):
+    """Run one authenticated, signal-only scan and send results to Telegram."""
+    _require_control_secret(x_control_token)
+    req = ForexBotRequest(
+        paper_trading=True,
+        approve_first=False,
+        pairs=[
+            p.strip()
+            for p in os.environ.get(
+                "SIGNAL_PAIRS", "EUR/USD,GBP/USD,USD/JPY,AUD/USD"
+            ).split(",")
+            if p.strip()
+        ],
+        timeframe=os.environ.get("SIGNAL_TIMEFRAME", "1h"),
+        max_positions=1,
+        register_schedule=False,
+        multi_timeframe=True,
+        signal_only=True,
+    )
+    result = await run_forex_cycle(req)
+    return {
+        "triggered": "daily-signal",
+        "signal_only": True,
+        "signals_generated": result.signals_generated,
+        "message": result.message,
+    }
 
 
 @app.get("/trigger/analyze/{pair}")
