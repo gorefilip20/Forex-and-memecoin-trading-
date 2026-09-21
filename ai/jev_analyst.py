@@ -114,8 +114,15 @@ async def jev_decide_memecoins(tokens: list[dict], open_mints: set) -> list[dict
             quality = result.answers["setup_quality"].score / 4
             momentum_prob = result.answers["momentum_real"].noul
 
-            tp_pct = MEMECOIN_MIN_TP_PCT + quality * (MEMECOIN_MAX_TP_PCT - MEMECOIN_MIN_TP_PCT) * 0.3
-            sl_pct = MEMECOIN_MIN_SL_PCT + (1 - quality) * (MEMECOIN_MAX_SL_PCT - MEMECOIN_MIN_SL_PCT) * 0.15
+            if quality >= 0.75 and momentum_prob >= 0.7:
+                tp_pct = 80.0 + quality * 120.0
+                sl_pct = 8.0 + (1 - quality) * 7.0
+            elif quality >= 0.5:
+                tp_pct = 40.0 + quality * 60.0
+                sl_pct = 12.0 + (1 - quality) * 10.0
+            else:
+                tp_pct = 20.0 + quality * 30.0
+                sl_pct = 15.0 + (1 - quality) * 15.0
             tp_pct = max(MEMECOIN_MIN_TP_PCT, min(MEMECOIN_MAX_TP_PCT, tp_pct))
             sl_pct = max(MEMECOIN_MIN_SL_PCT, min(MEMECOIN_MAX_SL_PCT, sl_pct))
 
@@ -265,6 +272,13 @@ async def jev_check_exit(position: dict, current_price: float, market: str) -> d
     else:
         pnl_pct = ((entry - current_price) / entry) * 100 if entry else 0
 
+    sl = position.get("stop_loss", position.get("stop_loss_usd", 0))
+    tp = position.get("take_profit", position.get("take_profit_usd", 0))
+
+    sl_distance_pct = abs(entry - sl) / entry * 100 if entry else 0
+    tp_distance_pct = abs(tp - entry) / entry * 100 if entry else 0
+    progress_to_tp = (pnl_pct / tp_distance_pct * 100) if tp_distance_pct > 0 else 0
+
     state = {
         "symbol": symbol,
         "market": market,
@@ -272,8 +286,13 @@ async def jev_check_exit(position: dict, current_price: float, market: str) -> d
         "entry_price": entry,
         "current_price": current_price,
         "pnl_pct": round(pnl_pct, 2),
-        "stop_loss": position.get("stop_loss", position.get("stop_loss_usd")),
-        "take_profit": position.get("take_profit", position.get("take_profit_usd")),
+        "stop_loss": sl,
+        "take_profit": tp,
+        "sl_distance_pct": round(sl_distance_pct, 2),
+        "tp_distance_pct": round(tp_distance_pct, 2),
+        "progress_to_tp_pct": round(progress_to_tp, 1),
+        "trail_active": position.get("trail_active", False),
+        "highest_pnl": position.get("highest_pnl_pips", position.get("highest_price", 0)),
     }
 
     try:
@@ -283,14 +302,18 @@ async def jev_check_exit(position: dict, current_price: float, market: str) -> d
                 "should_exit": Noul(
                     instructions=(
                         "Should this position be closed now, before hitting the take-profit or stop-loss? "
-                        "Consider whether the move has stalled, momentum reversed, or risk no longer "
-                        "justifies holding."
+                        "Exit early when: momentum has clearly reversed, price is pulling back from "
+                        "a peak toward the stop-loss, the trade has been open too long without progress, "
+                        "or risk no longer justifies holding. Keep holding when: price is trending toward "
+                        "the take-profit, the position is in decent profit and still moving."
                     ),
                 ),
                 "should_trail": Noul(
                     instructions=(
-                        "If the position is in profit, should the stop-loss be tightened "
-                        "to lock in gains while letting the position run further?"
+                        "Should the stop-loss be tightened to lock in gains? "
+                        "Trail the stop when: the position is well in profit (>50% of the way to TP), "
+                        "price has made a strong move and is at risk of reversal. "
+                        "Don't trail too aggressively if the trend is strong and steady."
                     ),
                 ),
             },

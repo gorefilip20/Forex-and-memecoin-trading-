@@ -45,7 +45,7 @@ from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
 from forex.signals import ForexSignalGenerator
 from forex.executor import ForexExecutor
-from ai.analyst import ai_decide_memecoins, ai_decide_forex
+from ai import ai_decide_memecoins, ai_decide_forex
 
 try:
     from codewords_client import AsyncCodewordsClient, logger as cw_logger, redis_client, run_service
@@ -471,7 +471,8 @@ async def run_forex_cycle(req: ForexBotRequest):
             trades_closed = len(closed)
             for c in closed:
                 pnl_str = f"${c['pnl_usd']:+.2f}"
-                if await send_telegram(http, f"[FOREX {c['type']}] {c['pair']} {c['direction']}: {pnl_str}"):
+                label = c['type'].replace('_', ' ')
+                if await send_telegram(http, f"[FOREX {label}] {c['pair']} {c['direction']}: {pnl_str}"):
                     alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
@@ -892,8 +893,8 @@ async def mt5_webhook(req: MT5SignalRequest):
                         "pair": sig["pair"],
                         "direction": sig["direction"],
                         "entry_price": sig["entry_price"],
-                        "sl": sig["sl"],
-                        "tp": sig["tp"],
+                        "sl": sig["stop_loss"],
+                        "tp": sig["take_profit"],
                         "confidence": sig.get("confidence", 0),
                         "lot_size": float(os.environ.get("FOREX_LOT_SIZE", "0.01")),
                     })

@@ -9,4 +9,4 @@ pydantic==2.11.3
 redis==5.2.1
 cffi
 cryptography
-typesafe-ai==0.1.0
+typesafe-sdk>=0.6.0

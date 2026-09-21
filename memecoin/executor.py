@@ -1,4 +1,8 @@
-"""Memecoin trade executor: Jupiter swaps + paper trading."""
+"""Memecoin trade executor: Jupiter swaps + paper trading.
+
+Includes Jev-powered smart exits (early close on momentum loss, trailing stops)
+and dynamic position sizing based on AI confidence.
+"""
 
 import base64
 import hashlib
@@ -31,6 +35,12 @@ from memecoin.discovery import fetch_token_price_usd, fetch_sol_usd_price
 
 logger = logging.getLogger("trading_bot")
 
+JEV_EXIT_THRESHOLD = 0.65
+JEV_TRAIL_THRESHOLD = 0.55
+TRAIL_ACTIVATE_PCT = 15.0
+TRAIL_STEP_PCT = 0.4
+BREAKEVEN_BUFFER_PCT = 2.0
+
 
 class MemecoinExecutor:
 
@@ -45,6 +55,9 @@ class MemecoinExecutor:
         mint = payload["mint"]
         cost = payload["cost_usd"]
         symbol = payload["symbol"]
+
+        confidence = _f(payload.get("confidence", 50))
+        adjusted_cost = _scale_cost(cost, confidence)
 
         fresh = await fetch_token_price_usd(self.http, mint)
         if fresh and fresh > 0:
@@ -61,26 +74,30 @@ class MemecoinExecutor:
 
         if paper:
             balance = _f(await self.redis.get(f"{self.ns}:mc:balance_usd"))
-            if cost > balance:
+            if adjusted_cost > balance:
                 return None
 
             entry = {
                 **payload,
-                "tokens": cost / price,
+                "cost_usd": adjusted_cost,
+                "tokens": adjusted_cost / price,
                 "paper": True,
                 "raw_tokens_out": None,
                 "opened_at": now_iso(),
+                "original_sl_usd": payload["stop_loss_usd"],
+                "highest_price": price,
+                "trail_active": False,
             }
-            await self.redis.set(f"{self.ns}:mc:balance_usd", str(balance - cost))
+            await self.redis.set(f"{self.ns}:mc:balance_usd", str(balance - adjusted_cost))
             await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(entry))
             await log_memecoin_trade(self.redis, self.ns, {
                 "type": "ENTRY", "mint": mint, "symbol": symbol,
-                "cost_usd": cost, "entry_price_usd": price,
+                "cost_usd": adjusted_cost, "entry_price_usd": price,
             })
             return entry
 
         try:
-            res = await self._live_buy(mint, cost, slippage_bps)
+            res = await self._live_buy(mint, adjusted_cost, slippage_bps)
         except Exception as e:
             logger.warning(f"Live buy failed for {mint}: {e}")
             return None
@@ -88,16 +105,20 @@ class MemecoinExecutor:
         actual_raw = await self._get_token_balance(mint)
         entry = {
             **payload,
+            "cost_usd": adjusted_cost,
             "tokens": 0.0,
             "paper": False,
             "raw_tokens_out": actual_raw or res["raw_tokens_out"],
             "tx": res["url"],
             "opened_at": now_iso(),
+            "original_sl_usd": payload["stop_loss_usd"],
+            "highest_price": price,
+            "trail_active": False,
         }
         await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(entry))
         await log_memecoin_trade(self.redis, self.ns, {
             "type": "ENTRY", "mint": mint, "symbol": symbol,
-            "cost_usd": cost, "entry_price_usd": price, "tx": res["url"],
+            "cost_usd": adjusted_cost, "entry_price_usd": price, "tx": res["url"],
         })
         return entry
 
@@ -112,8 +133,12 @@ class MemecoinExecutor:
 
             tp = pos["take_profit_usd"]
             sl = pos["stop_loss_usd"]
+            entry_price = pos["entry_price_usd"]
             reason = None
             sell_price = None
+
+            highest = max(pos.get("highest_price", entry_price), price)
+            pnl_pct = ((price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
 
             if price >= tp:
                 reason, sell_price = "TAKE_PROFIT", tp
@@ -121,7 +146,50 @@ class MemecoinExecutor:
                 reason, sell_price = "STOP_LOSS", sl
 
             if reason is None:
+                trail_active = pos.get("trail_active", False)
+                new_sl = sl
+
+                if pnl_pct >= TRAIL_ACTIVATE_PCT:
+                    if not trail_active:
+                        new_sl = entry_price * (1 + BREAKEVEN_BUFFER_PCT / 100)
+                        trail_active = True
+                        logger.info(f"Trailing stop activated for {pos.get('symbol', mint)}: moved SL to breakeven+{BREAKEVEN_BUFFER_PCT}%")
+
+                    trail_sl = highest * (1 - TRAIL_STEP_PCT)
+                    new_sl = max(new_sl, trail_sl)
+
+                if trail_active and new_sl > sl:
+                    pos["stop_loss_usd"] = new_sl
+                    pos["trail_active"] = True
+
+                    if price <= new_sl:
+                        reason, sell_price = "TRAIL_STOP", price
+
+                try:
+                    from ai import ai_check_exit
+                    jev_result = await ai_check_exit(pos, price, "memecoin")
+
+                    if reason is None and jev_result["should_exit"] >= JEV_EXIT_THRESHOLD:
+                        reason = "JEV_EXIT"
+                        sell_price = price
+                        logger.info(f"Jev recommends exit for {pos.get('symbol', mint)}: prob={jev_result['should_exit']:.0%}")
+
+                    elif reason is None and jev_result["should_trail"] >= JEV_TRAIL_THRESHOLD and pnl_pct > 5:
+                        tighter_sl = price * 0.92
+                        if tighter_sl > pos["stop_loss_usd"]:
+                            pos["stop_loss_usd"] = tighter_sl
+                            pos["trail_active"] = True
+                            logger.info(f"Jev tightened SL for {pos.get('symbol', mint)} to ${tighter_sl:.8g}")
+                except Exception as e:
+                    logger.debug(f"Jev exit check skipped for {pos.get('symbol', mint)}: {e}")
+
+            if reason is None:
+                pos["highest_price"] = highest
+                await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(pos))
                 continue
+
+            if sell_price is None:
+                sell_price = price
 
             if not paper:
                 raw_amt = await self._get_token_balance(mint)
@@ -312,3 +380,14 @@ def _load_keypair() -> Keypair:
         I = hmac.new(IR, b"\x00" + IL + idx.to_bytes(4, "big"), hashlib.sha512).digest()
         IL, IR = I[:32], I[32:]
     return Keypair.from_seed(IL)
+
+
+def _scale_cost(base_cost: float, confidence: float) -> float:
+    """Scale trade size based on AI confidence. Higher confidence = bigger position."""
+    if confidence >= 85:
+        return round(base_cost * 1.5, 2)
+    if confidence >= 75:
+        return round(base_cost * 1.25, 2)
+    if confidence >= 65:
+        return base_cost
+    return round(base_cost * 0.75, 2)
