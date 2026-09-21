@@ -41,6 +41,12 @@ TRAIL_ACTIVATE_PCT = 15.0
 TRAIL_STEP_PCT = 0.4
 BREAKEVEN_BUFFER_PCT = 2.0
 
+LADDER_ENABLED = True
+LADDER_LEVELS = [
+    {"pct_gain": 30.0, "sell_pct": 50.0},
+    {"pct_gain": 80.0, "sell_pct": 25.0},
+]
+
 
 class MemecoinExecutor:
 
@@ -80,6 +86,7 @@ class MemecoinExecutor:
             entry = {
                 **payload,
                 "cost_usd": adjusted_cost,
+                "original_cost_usd": adjusted_cost,
                 "tokens": adjusted_cost / price,
                 "paper": True,
                 "raw_tokens_out": None,
@@ -87,6 +94,8 @@ class MemecoinExecutor:
                 "original_sl_usd": payload["stop_loss_usd"],
                 "highest_price": price,
                 "trail_active": False,
+                "remaining_pct": 100.0,
+                "ladder_fills": [],
             }
             await self.redis.set(f"{self.ns}:mc:balance_usd", str(balance - adjusted_cost))
             await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(entry))
@@ -106,6 +115,7 @@ class MemecoinExecutor:
         entry = {
             **payload,
             "cost_usd": adjusted_cost,
+            "original_cost_usd": adjusted_cost,
             "tokens": 0.0,
             "paper": False,
             "raw_tokens_out": actual_raw or res["raw_tokens_out"],
@@ -114,6 +124,8 @@ class MemecoinExecutor:
             "original_sl_usd": payload["stop_loss_usd"],
             "highest_price": price,
             "trail_active": False,
+            "remaining_pct": 100.0,
+            "ladder_fills": [],
         }
         await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(entry))
         await log_memecoin_trade(self.redis, self.ns, {
@@ -136,9 +148,21 @@ class MemecoinExecutor:
             entry_price = pos["entry_price_usd"]
             reason = None
             sell_price = None
+            sell_fraction = 1.0
 
             highest = max(pos.get("highest_price", entry_price), price)
             pnl_pct = ((price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+
+            ladder_hit = self._check_ladder(pos, pnl_pct)
+            if ladder_hit:
+                partial = await self._execute_partial_exit(
+                    pos, mint, price, ladder_hit, paper, slippage_bps,
+                )
+                if partial:
+                    exits.append(partial)
+                    pos["highest_price"] = highest
+                    await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(pos))
+                    continue
 
             if price >= tp:
                 reason, sell_price = "TAKE_PROFIT", tp
@@ -202,6 +226,9 @@ class MemecoinExecutor:
                     logger.warning(f"Live exit failed for {mint}: {e}")
                     continue
 
+            remaining_pct = pos.get("remaining_pct", 100.0)
+            original_cost = pos.get("original_cost_usd", pos["cost_usd"])
+
             if paper:
                 proceeds = pos["tokens"] * sell_price
                 pnl = proceeds - pos["cost_usd"]
@@ -217,11 +244,90 @@ class MemecoinExecutor:
                 "type": reason, "mint": mint, "symbol": pos["symbol"],
                 "entry_price_usd": pos["entry_price_usd"],
                 "exit_price_usd": sell_price, "pnl_usd": round(pnl, 4),
+                "remaining_pct": 0,
             }
             await log_memecoin_trade(self.redis, self.ns, event)
             exits.append(event)
 
         return exits
+
+    def _check_ladder(self, pos: dict, pnl_pct: float) -> dict | None:
+        """Check if price has hit a profit-taking ladder level."""
+        if not LADDER_ENABLED:
+            return None
+        ladder_fills = pos.get("ladder_fills", [])
+        for level in LADDER_LEVELS:
+            target_pct = level["pct_gain"]
+            if pnl_pct >= target_pct and target_pct not in ladder_fills:
+                return level
+        return None
+
+    async def _execute_partial_exit(
+        self, pos: dict, mint: str, price: float,
+        ladder_level: dict, paper: bool, slippage_bps: int,
+    ) -> dict | None:
+        """Sell a fraction of the position at a ladder level."""
+        sell_pct = ladder_level["sell_pct"]
+        remaining_pct = pos.get("remaining_pct", 100.0)
+
+        actual_sell_pct = min(sell_pct, remaining_pct - 10)
+        if actual_sell_pct <= 0:
+            return None
+
+        sell_fraction = actual_sell_pct / 100.0
+        symbol = pos.get("symbol", mint)
+
+        if not paper:
+            raw_amt = await self._get_token_balance(mint)
+            sell_raw = int(raw_amt * (actual_sell_pct / remaining_pct))
+            if sell_raw <= 0:
+                return None
+            try:
+                await self._live_sell(mint, sell_raw, slippage_bps)
+            except Exception as e:
+                logger.warning(f"Partial sell failed for {mint}: {e}")
+                return None
+
+        if paper:
+            tokens_to_sell = pos["tokens"] * (actual_sell_pct / remaining_pct)
+            proceeds = tokens_to_sell * price
+            cost_portion = pos["cost_usd"] * (actual_sell_pct / remaining_pct)
+            pnl = proceeds - cost_portion
+
+            bal = _f(await self.redis.get(f"{self.ns}:mc:balance_usd"))
+            await self.redis.set(f"{self.ns}:mc:balance_usd", str(bal + proceeds))
+
+            pos["tokens"] -= tokens_to_sell
+            pos["cost_usd"] -= cost_portion
+        else:
+            cost_portion = pos["cost_usd"] * (actual_sell_pct / remaining_pct)
+            pnl = cost_portion * (price / pos["entry_price_usd"] - 1)
+            pos["cost_usd"] -= cost_portion
+
+        new_remaining = remaining_pct - actual_sell_pct
+        pos["remaining_pct"] = new_remaining
+        ladder_fills = pos.get("ladder_fills", [])
+        ladder_fills.append(ladder_level["pct_gain"])
+        pos["ladder_fills"] = ladder_fills
+
+        await self.redis.hset(f"{self.ns}:mc:positions", mint, json.dumps(pos))
+
+        pnl_pct = ((price - pos["entry_price_usd"]) / pos["entry_price_usd"]) * 100
+        logger.info(
+            f"Ladder exit {symbol}: sold {actual_sell_pct:.0f}% at +{pnl_pct:.1f}%, "
+            f"{new_remaining:.0f}% remaining"
+        )
+
+        event = {
+            "type": "LADDER_EXIT", "mint": mint, "symbol": symbol,
+            "entry_price_usd": pos["entry_price_usd"],
+            "exit_price_usd": price, "pnl_usd": round(pnl, 4),
+            "sell_pct": actual_sell_pct,
+            "remaining_pct": new_remaining,
+            "ladder_level": ladder_level["pct_gain"],
+        }
+        await log_memecoin_trade(self.redis, self.ns, event)
+        return event
 
     # ── Jupiter swap internals ─────────────────────────────────────
 

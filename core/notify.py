@@ -41,6 +41,14 @@ async def notify_trade(http: httpx.AsyncClient, event: dict, market: str) -> int
     if event_type == "ENTRY":
         price = event.get("entry_price", event.get("entry_price_usd", 0))
         text = f"[{market.upper()} ENTRY] {symbol} {direction} @ {price:.5g}"
+    elif event_type == "LADDER_EXIT":
+        sell_pct = event.get("sell_pct", 0)
+        remaining = event.get("remaining_pct", 0)
+        ladder_lvl = event.get("ladder_level", 0)
+        text = (
+            f"[{market.upper()} PARTIAL EXIT] {symbol}: sold {sell_pct:.0f}% at +{ladder_lvl:.0f}% "
+            f"(${pnl:+.2f}), {remaining:.0f}% still riding"
+        )
     else:
         text = f"[{market.upper()} {event_type}] {symbol} {direction}: ${pnl:+.2f}"
 

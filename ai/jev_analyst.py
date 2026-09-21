@@ -173,6 +173,23 @@ async def jev_decide_forex(signals: list[dict], open_pairs: set) -> list[dict]:
             })
             continue
 
+        mtf = signal.get("mtf_confirmation") or {}
+        mtf_context = {}
+        if mtf:
+            mtf_context["higher_tf"] = mtf.get("timeframe")
+            mtf_context["higher_trend"] = mtf.get("trend")
+            mtf_context["higher_trend_strength"] = mtf.get("trend_strength")
+            mtf_context["higher_momentum"] = mtf.get("momentum")
+            mtf_context["higher_rsi"] = mtf.get("rsi")
+            mtf_context["higher_macd_histogram"] = mtf.get("macd_histogram")
+            if mtf.get("top_timeframe"):
+                mtf_context["top_tf"] = mtf.get("top_timeframe")
+                mtf_context["top_trend"] = mtf.get("top_trend")
+                mtf_context["top_trend_strength"] = mtf.get("top_trend_strength")
+                mtf_context["top_rsi"] = mtf.get("top_rsi")
+                mtf_context["top_momentum"] = mtf.get("top_momentum")
+            mtf_context = {k: v for k, v in mtf_context.items() if v is not None}
+
         state = {
             "pair": pair,
             "direction": signal["direction"],
@@ -189,6 +206,7 @@ async def jev_decide_forex(signals: list[dict], open_pairs: set) -> list[dict]:
                 k: v for k, v in signal.get("indicators", {}).items()
                 if v is not None
             },
+            "multi_timeframe": mtf_context,
         }
 
         try:
@@ -201,11 +219,14 @@ async def jev_decide_forex(signals: list[dict], open_pairs: set) -> list[dict]:
                             "EXECUTE only when the technical picture is compelling: "
                             "multiple confirming indicators, trend alignment, risk:reward >= 1.5:1. "
                             "Be skeptical of signals in ranging/choppy markets (ADX < 20). "
-                            "Favor signals with multi-timeframe confirmation."
+                            "Multi-timeframe alignment is critical: check multi_timeframe data — "
+                            "when higher_trend and top_trend both align with the trade direction, "
+                            "that's a strong confirmation. When they conflict, be very cautious. "
+                            "RSI divergence across timeframes (entry TF vs higher TF) often signals reversals."
                         ),
                         criteria={
-                            "EXECUTE": "Strong technical setup. Multiple indicators confirm. Good risk/reward ratio.",
-                            "SKIP": "Weak or conflicting signals. Poor risk/reward. Choppy market conditions.",
+                            "EXECUTE": "Strong technical setup. Multi-timeframe trend alignment. Good risk/reward.",
+                            "SKIP": "Conflicting timeframes, weak signals, poor risk/reward, or choppy conditions.",
                         },
                     ),
                     "signal_strength": Score(
@@ -220,8 +241,12 @@ async def jev_decide_forex(signals: list[dict], open_pairs: set) -> list[dict]:
                     ),
                     "trend_confirmed": Noul(
                         instructions=(
-                            "Is the underlying trend genuinely confirmed by multiple timeframes "
-                            "and indicators, or is this potentially a counter-trend or ranging signal?"
+                            "Is the underlying trend genuinely confirmed by multiple timeframes? "
+                            "Check multi_timeframe: if higher_trend, top_trend, and the entry timeframe trend "
+                            "all agree, confidence should be high. If any conflict (e.g. entry is bullish but "
+                            "top_trend is bearish), this is likely counter-trend and risky. "
+                            "Also compare RSI levels across timeframes — overbought on higher TF with bullish "
+                            "entry signal is a warning."
                         ),
                     ),
                 },

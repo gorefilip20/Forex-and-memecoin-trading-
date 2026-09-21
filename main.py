@@ -42,6 +42,8 @@ from core.state import (
 from core.telegram import send_telegram, send_approval_message, send_forex_signal, tg_get, tg_post
 from core.notify import notify_all, notify_signal, notify_trade
 from core.risk import check_daily_drawdown, check_correlation, is_good_session_for_pair, calculate_analytics
+from core.news_filter import check_news_filter
+from core.equity_tracker import record_trade_result, is_trading_paused, reset_equity_tracker
 from memecoin.discovery import discover_candidates
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
@@ -330,12 +332,20 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                     rugs_blocked=0, message=msg,
                 )
 
+            pause_state = await is_trading_paused(redis, ns)
+            mc_paused = pause_state["paused"]
+            if mc_paused:
+                logger.warning(f"Equity tracker: {pause_state['reason']}")
+
             approvals_processed = await _process_memecoin_approvals(http, redis, ns, req, executor)
             balance, positions = await load_memecoin_state(redis, ns)
 
             exits = await executor.check_exits(positions, req.paper_trading, req.slippage_bps)
             for ex in exits:
                 await notify_trade(http, ex, "memecoin")
+                pnl = ex.get("pnl_usd", 0)
+                if ex.get("type") != "LADDER_EXIT":
+                    await record_trade_result(redis, ns, pnl)
                 alerts_sent += 1
             balance, positions = await load_memecoin_state(redis, ns)
 
@@ -347,7 +357,7 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
             open_mints = set(positions.keys())
             pending = await load_memecoin_pending(redis, ns)
 
-            if candidates and (len(positions) + len(pending)) < req.max_positions:
+            if candidates and (len(positions) + len(pending)) < req.max_positions and not mc_paused:
                 decisions = await ai_decide_memecoins(candidates, open_mints)
 
             for d in decisions:
@@ -511,6 +521,12 @@ async def run_forex_cycle(req: ForexBotRequest):
                     message=msg,
                 )
 
+            pause_state = await is_trading_paused(redis, ns)
+            if pause_state["paused"] and not req.signal_only:
+                logger.warning(f"Equity tracker: {pause_state['reason']}")
+                await notify_all(http, f"[PAUSED] {pause_state['reason']} Switching to signal-only mode.")
+                req = ForexBotRequest(**{**req.model_dump(), "signal_only": True})
+
             approvals = await _process_forex_approvals(http, redis, ns, req, fx_executor)
             balance, equity, positions = await load_forex_state(redis, ns)
 
@@ -518,6 +534,7 @@ async def run_forex_cycle(req: ForexBotRequest):
             trades_closed = len(closed)
             for c in closed:
                 await notify_trade(http, c, "forex")
+                await record_trade_result(redis, ns, c.get("pnl_usd", 0))
                 alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
@@ -551,6 +568,11 @@ async def run_forex_cycle(req: ForexBotRequest):
 
                 signal = next((s for s in raw_signals if s["pair"] == pair), None)
                 if not signal:
+                    continue
+
+                news = await check_news_filter(http, pair)
+                if not news["safe"]:
+                    logger.info(f"News filter blocked {pair}: {news['reason']}")
                     continue
 
                 corr = check_correlation(pair, signal["direction"], {k: v for k, v in positions.items()})
@@ -755,8 +777,92 @@ async def reset(x_control_token: str | None = Header(default=None)):
         await redis.set(f"{ns}:mc:balance_usd", "1000")
         await redis.set(f"{ns}:fx:balance_usd", "10000")
         await redis.set(f"{ns}:fx:equity_usd", "10000")
+        await reset_equity_tracker(redis, ns)
 
     return ResetResponse(reset=True, memecoin_balance_usd=1000.0, forex_balance_usd=10000.0)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TELEGRAM COMMAND INTERFACE
+# ══════════════════════════════════════════════════════════════════
+
+async def _handle_telegram_command(http, redis, ns, msg: dict, req) -> None:
+    """Process Telegram text commands from the user."""
+    text = (msg.get("text") or "").strip().lower()
+
+    if text in ("status", "/status", "balance", "/balance"):
+        mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+        fx_bal, _, fx_pos = await load_forex_state(redis, ns)
+        pause = await is_trading_paused(redis, ns)
+        mode = "PAPER" if req.paper_trading else "LIVE"
+        lines = [
+            f"Bot Status ({mode})",
+            f"Memecoin: ${mc_bal or 0:.2f} | {len(mc_pos)} positions",
+            f"Forex: ${fx_bal or 0:.2f} | {len(fx_pos)} positions",
+        ]
+        if pause["paused"]:
+            lines.append(f"PAUSED: {pause['reason']}")
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/positions", "positions", "/pos"):
+        mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+        fx_bal, _, fx_pos = await load_forex_state(redis, ns)
+        lines = ["Open Positions\n"]
+        if fx_pos:
+            lines.append("FOREX:")
+            for pid, p in fx_pos.items():
+                trail = " [TRAILING]" if p.get("trail_active") else ""
+                lines.append(f"  {p['pair']} {p['direction']} @ {p['entry_price']:.5f}{trail}")
+        else:
+            lines.append("FOREX: none")
+        if mc_pos:
+            lines.append("\nMEMECOIN:")
+            for mint, p in mc_pos.items():
+                remaining = p.get("remaining_pct", 100)
+                trail = " [TRAILING]" if p.get("trail_active") else ""
+                rem_str = f" ({remaining:.0f}% remaining)" if remaining < 100 else ""
+                lines.append(f"  {p['symbol']} @ ${p['entry_price_usd']:.8g}{trail}{rem_str}")
+        else:
+            lines.append("\nMEMECOIN: none")
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/analytics", "analytics", "/stats"):
+        stats = await calculate_analytics(redis, ns)
+        dd = await check_daily_drawdown(redis, ns)
+        lines = [
+            "Trading Analytics\n",
+            f"Total trades: {stats['total_trades']}",
+            f"Win rate: {stats.get('win_rate', 0):.1f}%",
+            f"Profit factor: {stats.get('profit_factor', 0):.2f}",
+            f"Sharpe ratio: {stats.get('sharpe_estimate', 0):.2f}",
+            f"Total P&L: ${stats.get('total_pnl', 0):.2f}",
+            f"Max drawdown: ${stats.get('max_drawdown', 0):.2f}",
+            f"Avg win: ${stats.get('avg_win', 0):.2f}",
+            f"Avg loss: ${stats.get('avg_loss', 0):.2f}",
+            f"\nToday: ${dd['daily_pnl']:.2f} ({dd['trades_today']} trades)",
+        ]
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/pause", "pause"):
+        from core.equity_tracker import record_trade_result
+        state = {"consecutive_losses": 99, "consecutive_wins": 0, "paused": True, "recovery_wins": 0}
+        await redis.set(f"{ns}:equity_tracker", json.dumps(state))
+        await send_telegram(http, "Bot PAUSED. Will only send signals, no new trades. Send /resume to restart.")
+
+    elif text in ("/resume", "resume"):
+        await reset_equity_tracker(redis, ns)
+        await send_telegram(http, "Bot RESUMED. Trading is active again.")
+
+    elif text in ("/help", "help"):
+        await send_telegram(http, (
+            "Bot Commands\n\n"
+            "/status - Balances and mode\n"
+            "/positions - All open positions\n"
+            "/analytics - Win rate, P&L, Sharpe\n"
+            "/pause - Stop new trades (signals only)\n"
+            "/resume - Resume trading\n"
+            "/help - This message"
+        ))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -791,17 +897,7 @@ async def _process_memecoin_approvals(http, redis, ns, req, executor) -> int:
         if not cq:
             msg = u.get("message")
             if msg:
-                text = (msg.get("text") or "").strip().lower()
-                if text in ("status", "/status", "balance", "/balance"):
-                    mc_bal, mc_pos = await load_memecoin_state(redis, ns)
-                    fx_bal, _, fx_pos = await load_forex_state(redis, ns)
-                    mode = "PAPER" if req.paper_trading else "LIVE"
-                    lines = [
-                        f"Bot status ({mode})",
-                        f"Memecoin: ${mc_bal or 0:.2f} | {len(mc_pos)} positions",
-                        f"Forex: ${fx_bal or 0:.2f} | {len(fx_pos)} positions",
-                    ]
-                    await send_telegram(http, "\n".join(lines))
+                await _handle_telegram_command(http, redis, ns, msg, req)
             continue
 
         cbid = cq.get("id")
