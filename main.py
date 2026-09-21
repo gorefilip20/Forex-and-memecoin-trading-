@@ -40,6 +40,8 @@ from core.state import (
     is_in_cooldown,
 )
 from core.telegram import send_telegram, send_approval_message, send_forex_signal, tg_get, tg_post
+from core.notify import notify_all, notify_signal, notify_trade
+from core.risk import check_daily_drawdown, check_correlation, is_good_session_for_pair, calculate_analytics
 from memecoin.discovery import discover_candidates
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
@@ -96,19 +98,19 @@ def _enforce_execution_mode(paper_trading: bool) -> None:
 
 
 async def _notify_error(msg: str):
-    """Send error notification to Telegram so the user knows what broke."""
+    """Send error notification to all configured channels."""
     try:
         async with httpx.AsyncClient(timeout=10) as http:
-            await send_telegram(http, f"[BOT ERROR] {msg}")
+            await notify_all(http, f"[BOT ERROR] {msg}")
     except Exception:
         pass
 
 
 async def _notify_cycle(msg: str):
-    """Send cycle status to Telegram."""
+    """Send cycle status to all configured channels."""
     try:
         async with httpx.AsyncClient(timeout=10) as http:
-            await send_telegram(http, msg)
+            await notify_all(http, msg)
     except Exception:
         pass
 
@@ -203,7 +205,7 @@ async def _daily_signal_loop():
             result = await run_forex_cycle(req)
             if result.signals_generated == 0:
                 async with httpx.AsyncClient(timeout=10) as http:
-                    await send_telegram(
+                    await notify_all(
                         http,
                         "DAILY MARKET SCAN\n\n"
                         "No qualified forex setup met the bot's filters today. "
@@ -221,7 +223,7 @@ async def _daily_signal_loop():
 
 
 async def _startup_notification():
-    """Send a Telegram notification when the bot starts."""
+    """Send a notification to all configured channels when the bot starts."""
     global _bot_started_at
     _bot_started_at = now_iso()
     async with httpx.AsyncClient(timeout=15) as http:
@@ -233,17 +235,20 @@ async def _startup_notification():
             os.environ.get("FOREX_LIVE", "").lower() == "true"
             and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
         )
+        from core.discord import discord_configured
+        from core.whatsapp import whatsapp_configured
         msg = (
             "Trading Bot Online\n\n"
             f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
             f"Forex: {'LIVE' if fx_live else 'PAPER'} mode\n"
             f"Daily signals: {'ON' if os.environ.get('DAILY_SIGNALS', '').lower() == 'true' else 'OFF'}\n"
-            f"Telegram configured: {'YES' if os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID') else 'NO'}\n"
+            f"Notifications: Telegram"
+            f"{' + Discord' if discord_configured() else ''}"
+            f"{' + WhatsApp' if whatsapp_configured() else ''}\n"
             f"Started: {_bot_started_at}\n\n"
-            "Type /status in this chat anytime to check positions.\n"
             "Signals are informational only; verify price before acting."
         )
-        await send_telegram(http, msg)
+        await notify_all(http, msg)
 
 
 @asynccontextmanager
@@ -308,10 +313,30 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                 balance = req.paper_starting_usd
                 await redis.set(f"{ns}:mc:balance_usd", str(balance))
 
+            max_dd_pct = float(os.environ.get("DAILY_MAX_DRAWDOWN_PCT", "3.0"))
+            dd_check = await check_daily_drawdown(redis, ns, max_dd_pct)
+            if dd_check["breached"]:
+                msg = (
+                    f"Memecoin cycle skipped: daily drawdown limit hit "
+                    f"({dd_check['drawdown_pct']:.1f}% / {max_dd_pct}% max)."
+                )
+                logger.warning(msg)
+                await notify_all(http, f"[RISK] {msg}")
+                return MemecoinCycleResponse(
+                    cycle_time=cycle_time, paper_trading=req.paper_trading, approve_first=req.approve_first,
+                    candidates_found=0, approvals_processed=0, alerts_sent=1,
+                    decisions=[], entries=[], exits=[], pending_approvals=0,
+                    balance_usd=round(balance or 0, 2), open_positions=len(positions),
+                    rugs_blocked=0, message=msg,
+                )
+
             approvals_processed = await _process_memecoin_approvals(http, redis, ns, req, executor)
             balance, positions = await load_memecoin_state(redis, ns)
 
             exits = await executor.check_exits(positions, req.paper_trading, req.slippage_bps)
+            for ex in exits:
+                await notify_trade(http, ex, "memecoin")
+                alerts_sent += 1
             balance, positions = await load_memecoin_state(redis, ns)
 
             candidates = await discover_candidates(
@@ -368,8 +393,8 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                         f"reasons={safety['reasons']}"
                     )
                     rugs_blocked += 1
-                    if await send_telegram(http, f"[BLOCKED] {cand['symbol']}: {'; '.join(safety['reasons'])}"):
-                        alerts_sent += 1
+                    await notify_all(http, f"[BLOCKED] {cand['symbol']}: {'; '.join(safety['reasons'])}")
+                    alerts_sent += 1
                     decisions = [
                         {**dd, "action": "SKIP", "reasoning": "rug-check: " + "; ".join(safety["reasons"])}
                         if dd.get("mint") == mint else dd
@@ -405,9 +430,13 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                                 "take_profit_usd", "stop_loss_usd", "confidence", "reasoning",
                             )
                         })
-                        label = "PAPER" if req.paper_trading else "LIVE"
-                        if await send_telegram(http, f"[{label} ENTRY] {payload['symbol']} @ ${payload['entry_price_usd']:.8g} | cost ${payload['cost_usd']:.2f}"):
-                            alerts_sent += 1
+                        entry_event = {
+                            "type": "ENTRY", "symbol": payload["symbol"],
+                            "direction": "BUY",
+                            "entry_price_usd": payload["entry_price_usd"],
+                        }
+                        await notify_trade(http, entry_event, "memecoin")
+                        alerts_sent += 1
                     break
 
             balance, positions = await load_memecoin_state(redis, ns)
@@ -464,16 +493,32 @@ async def run_forex_cycle(req: ForexBotRequest):
                 await redis.set(f"{ns}:fx:equity_usd", str(balance))
                 equity = balance
 
+            max_dd_pct = float(os.environ.get("DAILY_MAX_DRAWDOWN_PCT", "3.0"))
+            dd_check = await check_daily_drawdown(redis, ns, max_dd_pct)
+            if dd_check["breached"]:
+                msg = (
+                    f"Forex cycle skipped: daily drawdown limit hit "
+                    f"({dd_check['drawdown_pct']:.1f}% / {max_dd_pct}% max). "
+                    f"P&L today: ${dd_check['daily_pnl']:.2f} across {dd_check['trades_today']} trades."
+                )
+                logger.warning(msg)
+                await notify_all(http, f"[RISK] {msg}")
+                return ForexCycleResponse(
+                    cycle_time=cycle_time, paper_trading=req.paper_trading, approve_first=req.approve_first,
+                    pairs_analyzed=0, signals_generated=0, trades_executed=0, trades_closed=0,
+                    alerts_sent=1, signals=[], open_positions=len(positions),
+                    balance_usd=round(balance or 0, 2), equity_usd=round(equity, 2),
+                    message=msg,
+                )
+
             approvals = await _process_forex_approvals(http, redis, ns, req, fx_executor)
             balance, equity, positions = await load_forex_state(redis, ns)
 
             closed = await fx_executor.check_exits(req.paper_trading)
             trades_closed = len(closed)
             for c in closed:
-                pnl_str = f"${c['pnl_usd']:+.2f}"
-                label = c['type'].replace('_', ' ')
-                if await send_telegram(http, f"[FOREX {label}] {c['pair']} {c['direction']}: {pnl_str}"):
-                    alerts_sent += 1
+                await notify_trade(http, c, "forex")
+                alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
 
@@ -508,6 +553,16 @@ async def run_forex_cycle(req: ForexBotRequest):
                 if not signal:
                     continue
 
+                corr = check_correlation(pair, signal["direction"], {k: v for k, v in positions.items()})
+                if not corr["ok"]:
+                    logger.info(f"Correlation filter: {corr['reason']}")
+                    continue
+
+                session_info = is_good_session_for_pair(pair)
+                if not session_info["optimal"]:
+                    conf = conf * 0.85
+                    signal["session_note"] = session_info["reason"]
+
                 if decision.get("adjusted_sl_pips"):
                     pip_val = get_pip_value(pair)
                     new_sl_pips = _f(decision["adjusted_sl_pips"])
@@ -530,8 +585,8 @@ async def run_forex_cycle(req: ForexBotRequest):
                 signal["reasoning"] = str(decision.get("reasoning", signal.get("reasoning", "")))[:200]
                 signals_out.append(signal)
 
-                if await send_forex_signal(http, signal):
-                    alerts_sent += 1
+                await notify_signal(http, signal)
+                alerts_sent += 1
 
                 if req.signal_only:
                     continue
@@ -550,13 +605,13 @@ async def run_forex_cycle(req: ForexBotRequest):
                     )
                     if position:
                         trades_executed += 1
-                        label = "PAPER" if req.paper_trading else "LIVE"
-                        if await send_telegram(
-                            http,
-                            f"[{label} FOREX ENTRY] {pair} {signal['direction']} @ {signal['entry_price']:.5f} | "
-                            f"SL: {signal['sl_pips']:.0f} pips, TP: {signal['tp_pips']:.0f} pips",
-                        ):
-                            alerts_sent += 1
+                        entry_event = {
+                            "type": "ENTRY", "pair": pair,
+                            "direction": signal["direction"],
+                            "entry_price": signal["entry_price"],
+                        }
+                        await notify_trade(http, entry_event, "forex")
+                        alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
 
@@ -673,6 +728,16 @@ async def dashboard():
         total_trades=stats.get("total_trades", 0),
         win_rate=stats.get("win_rate", 0),
     )
+
+
+@app.get("/analytics")
+async def analytics():
+    """Detailed trading performance analytics: win rate, Sharpe, drawdown, by-pair breakdown."""
+    async with redis_client() as (redis, ns):
+        stats = await calculate_analytics(redis, ns)
+        dd = await check_daily_drawdown(redis, ns)
+        stats["daily_drawdown"] = dd
+    return stats
 
 
 @app.post("/reset", response_model=ResetResponse)
@@ -1012,9 +1077,9 @@ async def trigger_analyze_pair(pair: str, x_control_token: str | None = Header(d
         generator = ForexSignalGenerator(http)
         signal = await generator.analyze_pair(pair, "1h", multi_timeframe=True)
         if signal and signal.get("confidence", 0) > 0:
-            await send_forex_signal(http, signal)
-            return {"pair": pair, "signal": signal, "telegram": "sent"}
-        return {"pair": pair, "signal": signal, "telegram": "no signal met threshold"}
+            sent = await notify_signal(http, signal)
+            return {"pair": pair, "signal": signal, "notifications_sent": sent}
+        return {"pair": pair, "signal": signal, "notifications_sent": 0}
 
 
 # ══════════════════════════════════════════════════════════════════
