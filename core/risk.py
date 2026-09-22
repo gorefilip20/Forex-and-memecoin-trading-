@@ -55,7 +55,7 @@ async def check_daily_drawdown(redis, ns: str, max_drawdown_pct: float = 3.0) ->
     trade_count = 0
     for entry in raw:
         trade = json.loads(_dec(entry))
-        if trade.get("type") not in ("TAKE_PROFIT", "STOP_LOSS", "TP_HIT", "SL_HIT", "JEV_EXIT", "TRAIL_STOP", "MANUAL_CLOSE"):
+        if trade.get("type") not in ("TAKE_PROFIT", "STOP_LOSS", "TP_HIT", "SL_HIT", "JEV_EXIT", "TRAIL_STOP", "MANUAL_CLOSE", "LADDER_EXIT"):
             continue
         ts = trade.get("timestamp", trade.get("closed_at", ""))
         if today not in ts and not ts.startswith(today):
@@ -168,7 +168,7 @@ async def calculate_analytics(redis, ns: str) -> dict:
     trades = [json.loads(_dec(x)) for x in raw]
     closed = [
         t for t in trades
-        if t.get("type") in ("TAKE_PROFIT", "STOP_LOSS", "TP_HIT", "SL_HIT", "JEV_EXIT", "TRAIL_STOP", "MANUAL_CLOSE")
+        if t.get("type") in ("TAKE_PROFIT", "STOP_LOSS", "TP_HIT", "SL_HIT", "JEV_EXIT", "TRAIL_STOP", "MANUAL_CLOSE", "LADDER_EXIT")
     ]
 
     if not closed:

@@ -165,7 +165,7 @@ async def _auto_forex_loop():
                 pairs=fx_pairs,
                 schedule_interval_minutes=interval,
                 register_schedule=False,
-                multi_timeframe=False,
+                multi_timeframe=True,
             )
             result = await run_forex_cycle(req)
             logger.info(f"Forex auto-cycle done: {result.message}")

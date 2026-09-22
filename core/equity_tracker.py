@@ -48,7 +48,7 @@ async def record_trade_result(redis, ns: str, pnl: float) -> dict:
                 state["paused"] = False
                 state["recovery_wins"] = 0
                 logger.info("Equity tracker: resuming after recovery wins")
-    else:
+    elif pnl < 0:
         state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
         state["consecutive_wins"] = 0
         state["recovery_wins"] = 0
