@@ -15,7 +15,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -44,7 +44,7 @@ from core.notify import notify_all, notify_signal, notify_trade
 from core.risk import check_daily_drawdown, check_correlation, is_good_session_for_pair, calculate_analytics
 from core.news_filter import check_news_filter
 from core.equity_tracker import record_trade_result, is_trading_paused, reset_equity_tracker
-from memecoin.discovery import discover_candidates
+from memecoin.discovery import discover_candidates, check_sol_trend
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
 from forex.signals import ForexSignalGenerator
@@ -224,6 +224,67 @@ async def _daily_signal_loop():
         await asyncio.sleep(interval * 60)
 
 
+async def _daily_report_loop():
+    """Send a daily P&L summary report at a configurable UTC hour."""
+    report_hour = int(os.environ.get("DAILY_REPORT_HOUR_UTC", "21"))
+    await asyncio.sleep(60)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=report_hour, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(days=1)
+            wait_secs = (target - now).total_seconds()
+            await asyncio.sleep(wait_secs)
+
+            async with httpx.AsyncClient(timeout=15) as http:
+                async with redis_client() as (redis, ns):
+                    stats = await calculate_analytics(redis, ns)
+                    dd = await check_daily_drawdown(redis, ns)
+                    mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+                    fx_bal, fx_eq, fx_pos = await load_forex_state(redis, ns)
+                    pause_state = await is_trading_paused(redis, ns)
+
+                    lines = [
+                        "DAILY TRADING REPORT",
+                        "",
+                        f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                        "",
+                        f"Today's P&L: ${dd['daily_pnl']:+.2f} ({dd['trades_today']} trades)",
+                        f"Drawdown: {dd['drawdown_pct']:.1f}% / {dd['max_drawdown_pct']}% limit",
+                        "",
+                        "All-Time Stats:",
+                        f"  Total trades: {stats.get('total_trades', 0)}",
+                        f"  Win rate: {stats.get('win_rate', 0):.1f}%",
+                        f"  Profit factor: {stats.get('profit_factor', 0):.2f}",
+                        f"  Sharpe ratio: {stats.get('sharpe_estimate', 0):.2f}",
+                        f"  Total P&L: ${stats.get('total_pnl', 0):.2f}",
+                        f"  Max drawdown: ${stats.get('max_drawdown', 0):.2f}",
+                        "",
+                        "Balances:",
+                        f"  Memecoin: ${mc_bal or 0:.2f} ({len(mc_pos)} open)",
+                        f"  Forex: ${fx_bal or 0:.2f} / Equity ${fx_eq:.2f} ({len(fx_pos)} open)",
+                    ]
+
+                    if pause_state["paused"]:
+                        lines.append(f"\nSTATUS: PAUSED - {pause_state['reason']}")
+
+                    by_pair = stats.get("by_pair", {})
+                    if by_pair:
+                        lines.append("")
+                        lines.append("Top Pairs:")
+                        sorted_pairs = sorted(by_pair.items(), key=lambda x: x[1]["pnl"], reverse=True)[:5]
+                        for pair, pstats in sorted_pairs:
+                            lines.append(f"  {pair}: ${pstats['pnl']:+.2f} ({pstats['win_rate']:.0f}% win, {pstats['trades']} trades)")
+
+                    await notify_all(http, "\n".join(lines))
+                    logger.info("Daily report sent")
+
+        except Exception as e:
+            logger.error(f"Daily report error: {e}")
+            await asyncio.sleep(3600)
+
+
 async def _startup_notification():
     """Send a notification to all configured channels when the bot starts."""
     global _bot_started_at
@@ -239,11 +300,17 @@ async def _startup_notification():
         )
         from core.discord import discord_configured
         from core.whatsapp import whatsapp_configured
+        sol_filter = os.environ.get("SOL_TREND_FILTER", "true").lower() == "true"
+        daily_report = os.environ.get("DAILY_REPORT", "true").lower() == "true"
         msg = (
-            "Trading Bot Online\n\n"
+            "Trading Bot v4.0 Online\n\n"
             f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
             f"Forex: {'LIVE' if fx_live else 'PAPER'} mode\n"
             f"Daily signals: {'ON' if os.environ.get('DAILY_SIGNALS', '').lower() == 'true' else 'OFF'}\n"
+            f"Daily P&L report: {'ON' if daily_report else 'OFF'}\n"
+            f"SOL trend filter: {'ON' if sol_filter else 'OFF'}\n"
+            f"Trailing stops: ON | Profit ladder: ON\n"
+            f"Daily drawdown limit: {os.environ.get('DAILY_MAX_DRAWDOWN_PCT', '3.0')}%\n"
             f"Notifications: Telegram"
             f"{' + Discord' if discord_configured() else ''}"
             f"{' + WhatsApp' if whatsapp_configured() else ''}\n"
@@ -262,6 +329,8 @@ async def lifespan(app: FastAPI):
         _scheduler_tasks.append(asyncio.create_task(_auto_forex_loop()))
     if os.environ.get("DAILY_SIGNALS", "false").lower() == "true":
         _scheduler_tasks.append(asyncio.create_task(_daily_signal_loop()))
+    if os.environ.get("DAILY_REPORT", "true").lower() == "true":
+        _scheduler_tasks.append(asyncio.create_task(_daily_report_loop()))
     asyncio.create_task(_startup_notification())
     logger.info("Trading bot started, background loops active" if auto_trade else "Trading bot started, manual mode")
     yield
@@ -277,7 +346,7 @@ app = FastAPI(
         "Memecoin: DexScreener discovery with enhanced rug-pull protection and Jupiter execution on Solana. "
         "MT5 bridge: webhook endpoint for MetaTrader 5 Expert Advisors to fetch and execute signals."
     ),
-    version="3.1.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -357,7 +426,16 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
             open_mints = set(positions.keys())
             pending = await load_memecoin_pending(redis, ns)
 
-            if candidates and (len(positions) + len(pending)) < req.max_positions and not mc_paused:
+            sol_trend_ok = True
+            sol_trend_filter = os.environ.get("SOL_TREND_FILTER", "true").lower() == "true"
+            if sol_trend_filter and candidates:
+                sol_trend = await check_sol_trend(http)
+                if not sol_trend["ok"]:
+                    sol_trend_ok = False
+                    logger.info(f"SOL trend filter: blocking buys ({sol_trend['reason']})")
+                    await _notify_cycle(f"[FILTER] SOL downtrend detected: {sol_trend['reason']}. Skipping new buys.")
+
+            if candidates and (len(positions) + len(pending)) < req.max_positions and not mc_paused and sol_trend_ok:
                 decisions = await ai_decide_memecoins(candidates, open_mints)
 
             for d in decisions:
