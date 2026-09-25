@@ -1,6 +1,7 @@
 """Token discovery via DexScreener with enhanced filtering."""
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -83,6 +84,30 @@ async def _fetch_trending_solana(http: httpx.AsyncClient) -> list[str]:
         return []
 
 
+async def check_sol_trend(http: httpx.AsyncClient) -> dict:
+    """Check SOL/USD price trend to filter memecoin buys in downtrends."""
+    try:
+        r = await http.get(f"{DEXSCREENER_BASE}/latest/dex/tokens/{SOL_MINT}", timeout=15)
+        r.raise_for_status()
+        pairs = r.json().get("pairs", [])
+        if not pairs:
+            return {"ok": True, "change_1h": 0, "reason": "no data"}
+        best = max(pairs, key=lambda p: (p.get("liquidity", {}).get("usd", 0) or 0))
+        change_1h = _f((best.get("priceChange", {}) or {}).get("h1"))
+        change_5m = _f((best.get("priceChange", {}) or {}).get("m5"))
+        min_change = float(os.environ.get("SOL_TREND_MIN_CHANGE_1H", "-3.0"))
+        return {
+            "ok": change_1h > min_change,
+            "change_1h": change_1h,
+            "change_5m": change_5m,
+            "price_usd": _f(best.get("priceUsd")),
+            "reason": f"SOL 1h: {change_1h:+.1f}%",
+        }
+    except Exception as e:
+        logger.warning(f"SOL trend check failed: {e}")
+        return {"ok": True, "change_1h": 0, "reason": "check failed"}
+
+
 async def discover_candidates(
     http: httpx.AsyncClient,
     min_liquidity: float,
@@ -161,6 +186,9 @@ async def discover_candidates(
             price_change_1h = _f((pair.get("priceChange", {}) or {}).get("h1"))
             price_change_24h = _f((pair.get("priceChange", {}) or {}).get("h24"))
 
+            vol_to_mcap = vol / mcap if mcap and mcap > 0 else 0
+            volume_spike = min(vol_to_mcap * 2, 3.0) if vol_to_mcap > 0.5 else 0
+
             score = (
                 min(vol / 100_000, 5) +
                 min(ratio, 3) +
@@ -168,7 +196,10 @@ async def discover_candidates(
                 max(0, (max_age_hours - age_hours) / max_age_hours) * 2 +
                 (1.0 if price_change_1h > 0 else 0) +
                 (0.5 if price_change_5m > 0 else 0) +
-                (0.5 if buys > 20 else 0)
+                (0.5 if buys > 20 else 0) +
+                volume_spike +
+                (1.5 if price_change_5m > 5 else 0) +
+                (1.0 if ratio > 2.0 and buys > 30 else 0)
             )
 
             candidates.append({

@@ -49,14 +49,26 @@ Dual-market autonomous trading platform that handles both **forex** and **Solana
 
 The API will be available at `http://localhost:8000`. Docs at `/docs`.
 
+## AI Decision Engine
+
+The bot supports two AI engines for trade decisions:
+
+**TypeSafe Jev (recommended)** — Set `TYPESAFE_API_KEY` and Jev handles all decisions automatically. Instead of prompting a text model and parsing JSON, Jev returns typed judgments with calibrated probabilities. Each trade decision uses three primitives: **Choice** (buy/sell/skip), **Score** (setup quality 0-4), and **Noul** (yes/no conditions like "is momentum genuine?"). The bot also uses Jev for exit decisions on open positions, evaluating whether to close early or tighten stops.
+
+**OpenAI (fallback)** — If no `TYPESAFE_API_KEY` is set, the bot falls back to GPT-4o-mini with structured JSON prompts, the same way it worked before.
+
+The switch is automatic: set the key you have and the bot routes decisions to the right engine.
+
 ## Required API Keys
 
 | Key | Purpose | Where to Get |
 |-----|---------|--------------|
-| `OPENAI_API_KEY` | AI trading decisions | platform.openai.com |
+| `TYPESAFE_API_KEY` | AI trading decisions (Jev) | typesafe.ai |
 | `TELEGRAM_BOT_TOKEN` | Alerts & approvals | @BotFather on Telegram |
 | `TELEGRAM_CHAT_ID` | Your chat ID | @userinfobot on Telegram |
 | `TWELVE_DATA_API_KEY` | Forex price data | twelvedata.com (free tier: 800/day) |
+
+`OPENAI_API_KEY` is needed only if you don't set `TYPESAFE_API_KEY`.
 
 ### Optional (for live trading)
 
@@ -89,7 +101,8 @@ The API will be available at `http://localhost:8000`. Docs at `/docs`.
 │   ├── safety.py        # Enhanced rug-pull detection
 │   └── executor.py      # Paper + Jupiter live execution
 ├── ai/
-│   └── analyst.py       # AI decision engine for both markets
+│   ├── analyst.py       # OpenAI decision engine (fallback)
+│   └── jev_analyst.py   # TypeSafe Jev decision engine (primary)
 ├── requirements.txt
 └── .env.example
 ```

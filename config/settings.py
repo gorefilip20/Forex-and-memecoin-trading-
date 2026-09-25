@@ -60,6 +60,7 @@ TA_ADX_PERIOD = 14
 TELEGRAM_API = "https://api.telegram.org"
 APPROVAL_TTL_SECONDS = 1800
 AI_MODEL = "gpt-4o-mini"
+AI_ENGINE = os.environ.get("AI_ENGINE", "auto")  # "jev", "openai", or "auto" (jev if key present)
 
 # Data provider URLs (free tier)
 TWELVE_DATA_BASE = "https://api.twelvedata.com"

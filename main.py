@@ -15,7 +15,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -40,12 +40,16 @@ from core.state import (
     is_in_cooldown,
 )
 from core.telegram import send_telegram, send_approval_message, send_forex_signal, tg_get, tg_post
-from memecoin.discovery import discover_candidates
+from core.notify import notify_all, notify_signal, notify_trade
+from core.risk import check_daily_drawdown, check_correlation, is_good_session_for_pair, calculate_analytics
+from core.news_filter import check_news_filter
+from core.equity_tracker import record_trade_result, is_trading_paused, reset_equity_tracker
+from memecoin.discovery import discover_candidates, check_sol_trend
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
 from forex.signals import ForexSignalGenerator
 from forex.executor import ForexExecutor
-from ai.analyst import ai_decide_memecoins, ai_decide_forex
+from ai import ai_decide_memecoins, ai_decide_forex
 
 try:
     from codewords_client import AsyncCodewordsClient, logger as cw_logger, redis_client, run_service
@@ -96,19 +100,19 @@ def _enforce_execution_mode(paper_trading: bool) -> None:
 
 
 async def _notify_error(msg: str):
-    """Send error notification to Telegram so the user knows what broke."""
+    """Send error notification to all configured channels."""
     try:
         async with httpx.AsyncClient(timeout=10) as http:
-            await send_telegram(http, f"[BOT ERROR] {msg}")
+            await notify_all(http, f"[BOT ERROR] {msg}")
     except Exception:
         pass
 
 
 async def _notify_cycle(msg: str):
-    """Send cycle status to Telegram."""
+    """Send cycle status to all configured channels."""
     try:
         async with httpx.AsyncClient(timeout=10) as http:
-            await send_telegram(http, msg)
+            await notify_all(http, msg)
     except Exception:
         pass
 
@@ -161,7 +165,7 @@ async def _auto_forex_loop():
                 pairs=fx_pairs,
                 schedule_interval_minutes=interval,
                 register_schedule=False,
-                multi_timeframe=False,
+                multi_timeframe=True,
             )
             result = await run_forex_cycle(req)
             logger.info(f"Forex auto-cycle done: {result.message}")
@@ -203,7 +207,7 @@ async def _daily_signal_loop():
             result = await run_forex_cycle(req)
             if result.signals_generated == 0:
                 async with httpx.AsyncClient(timeout=10) as http:
-                    await send_telegram(
+                    await notify_all(
                         http,
                         "DAILY MARKET SCAN\n\n"
                         "No qualified forex setup met the bot's filters today. "
@@ -220,8 +224,69 @@ async def _daily_signal_loop():
         await asyncio.sleep(interval * 60)
 
 
+async def _daily_report_loop():
+    """Send a daily P&L summary report at a configurable UTC hour."""
+    report_hour = int(os.environ.get("DAILY_REPORT_HOUR_UTC", "21"))
+    await asyncio.sleep(60)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=report_hour, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(days=1)
+            wait_secs = (target - now).total_seconds()
+            await asyncio.sleep(wait_secs)
+
+            async with httpx.AsyncClient(timeout=15) as http:
+                async with redis_client() as (redis, ns):
+                    stats = await calculate_analytics(redis, ns)
+                    dd = await check_daily_drawdown(redis, ns)
+                    mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+                    fx_bal, fx_eq, fx_pos = await load_forex_state(redis, ns)
+                    pause_state = await is_trading_paused(redis, ns)
+
+                    lines = [
+                        "DAILY TRADING REPORT",
+                        "",
+                        f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                        "",
+                        f"Today's P&L: ${dd['daily_pnl']:+.2f} ({dd['trades_today']} trades)",
+                        f"Drawdown: {dd['drawdown_pct']:.1f}% / {dd['max_drawdown_pct']}% limit",
+                        "",
+                        "All-Time Stats:",
+                        f"  Total trades: {stats.get('total_trades', 0)}",
+                        f"  Win rate: {stats.get('win_rate', 0):.1f}%",
+                        f"  Profit factor: {stats.get('profit_factor', 0):.2f}",
+                        f"  Sharpe ratio: {stats.get('sharpe_estimate', 0):.2f}",
+                        f"  Total P&L: ${stats.get('total_pnl', 0):.2f}",
+                        f"  Max drawdown: ${stats.get('max_drawdown', 0):.2f}",
+                        "",
+                        "Balances:",
+                        f"  Memecoin: ${mc_bal or 0:.2f} ({len(mc_pos)} open)",
+                        f"  Forex: ${fx_bal or 0:.2f} / Equity ${fx_eq:.2f} ({len(fx_pos)} open)",
+                    ]
+
+                    if pause_state["paused"]:
+                        lines.append(f"\nSTATUS: PAUSED - {pause_state['reason']}")
+
+                    by_pair = stats.get("by_pair", {})
+                    if by_pair:
+                        lines.append("")
+                        lines.append("Top Pairs:")
+                        sorted_pairs = sorted(by_pair.items(), key=lambda x: x[1]["pnl"], reverse=True)[:5]
+                        for pair, pstats in sorted_pairs:
+                            lines.append(f"  {pair}: ${pstats['pnl']:+.2f} ({pstats['win_rate']:.0f}% win, {pstats['trades']} trades)")
+
+                    await notify_all(http, "\n".join(lines))
+                    logger.info("Daily report sent")
+
+        except Exception as e:
+            logger.error(f"Daily report error: {e}")
+            await asyncio.sleep(3600)
+
+
 async def _startup_notification():
-    """Send a Telegram notification when the bot starts."""
+    """Send a notification to all configured channels when the bot starts."""
     global _bot_started_at
     _bot_started_at = now_iso()
     async with httpx.AsyncClient(timeout=15) as http:
@@ -233,17 +298,26 @@ async def _startup_notification():
             os.environ.get("FOREX_LIVE", "").lower() == "true"
             and os.environ.get("LIVE_TRADING_UNLOCK", "").lower() == "true"
         )
+        from core.discord import discord_configured
+        from core.whatsapp import whatsapp_configured
+        sol_filter = os.environ.get("SOL_TREND_FILTER", "true").lower() == "true"
+        daily_report = os.environ.get("DAILY_REPORT", "true").lower() == "true"
         msg = (
-            "Trading Bot Online\n\n"
+            "Trading Bot v4.0 Online\n\n"
             f"Memecoin: {'LIVE' if mc_live else 'PAPER'} mode\n"
             f"Forex: {'LIVE' if fx_live else 'PAPER'} mode\n"
             f"Daily signals: {'ON' if os.environ.get('DAILY_SIGNALS', '').lower() == 'true' else 'OFF'}\n"
-            f"Telegram configured: {'YES' if os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID') else 'NO'}\n"
+            f"Daily P&L report: {'ON' if daily_report else 'OFF'}\n"
+            f"SOL trend filter: {'ON' if sol_filter else 'OFF'}\n"
+            f"Trailing stops: ON | Profit ladder: ON\n"
+            f"Daily drawdown limit: {os.environ.get('DAILY_MAX_DRAWDOWN_PCT', '3.0')}%\n"
+            f"Notifications: Telegram"
+            f"{' + Discord' if discord_configured() else ''}"
+            f"{' + WhatsApp' if whatsapp_configured() else ''}\n"
             f"Started: {_bot_started_at}\n\n"
-            "Type /status in this chat anytime to check positions.\n"
             "Signals are informational only; verify price before acting."
         )
-        await send_telegram(http, msg)
+        await notify_all(http, msg)
 
 
 @asynccontextmanager
@@ -255,6 +329,8 @@ async def lifespan(app: FastAPI):
         _scheduler_tasks.append(asyncio.create_task(_auto_forex_loop()))
     if os.environ.get("DAILY_SIGNALS", "false").lower() == "true":
         _scheduler_tasks.append(asyncio.create_task(_daily_signal_loop()))
+    if os.environ.get("DAILY_REPORT", "true").lower() == "true":
+        _scheduler_tasks.append(asyncio.create_task(_daily_report_loop()))
     asyncio.create_task(_startup_notification())
     logger.info("Trading bot started, background loops active" if auto_trade else "Trading bot started, manual mode")
     yield
@@ -270,7 +346,7 @@ app = FastAPI(
         "Memecoin: DexScreener discovery with enhanced rug-pull protection and Jupiter execution on Solana. "
         "MT5 bridge: webhook endpoint for MetaTrader 5 Expert Advisors to fetch and execute signals."
     ),
-    version="3.1.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -308,10 +384,38 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                 balance = req.paper_starting_usd
                 await redis.set(f"{ns}:mc:balance_usd", str(balance))
 
+            max_dd_pct = float(os.environ.get("DAILY_MAX_DRAWDOWN_PCT", "3.0"))
+            dd_check = await check_daily_drawdown(redis, ns, max_dd_pct)
+            if dd_check["breached"]:
+                msg = (
+                    f"Memecoin cycle skipped: daily drawdown limit hit "
+                    f"({dd_check['drawdown_pct']:.1f}% / {max_dd_pct}% max)."
+                )
+                logger.warning(msg)
+                await notify_all(http, f"[RISK] {msg}")
+                return MemecoinCycleResponse(
+                    cycle_time=cycle_time, paper_trading=req.paper_trading, approve_first=req.approve_first,
+                    candidates_found=0, approvals_processed=0, alerts_sent=1,
+                    decisions=[], entries=[], exits=[], pending_approvals=0,
+                    balance_usd=round(balance or 0, 2), open_positions=len(positions),
+                    rugs_blocked=0, message=msg,
+                )
+
+            pause_state = await is_trading_paused(redis, ns)
+            mc_paused = pause_state["paused"]
+            if mc_paused:
+                logger.warning(f"Equity tracker: {pause_state['reason']}")
+
             approvals_processed = await _process_memecoin_approvals(http, redis, ns, req, executor)
             balance, positions = await load_memecoin_state(redis, ns)
 
             exits = await executor.check_exits(positions, req.paper_trading, req.slippage_bps)
+            for ex in exits:
+                await notify_trade(http, ex, "memecoin")
+                pnl = ex.get("pnl_usd", 0)
+                if ex.get("type") != "LADDER_EXIT":
+                    await record_trade_result(redis, ns, pnl)
+                alerts_sent += 1
             balance, positions = await load_memecoin_state(redis, ns)
 
             candidates = await discover_candidates(
@@ -322,7 +426,16 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
             open_mints = set(positions.keys())
             pending = await load_memecoin_pending(redis, ns)
 
-            if candidates and (len(positions) + len(pending)) < req.max_positions:
+            sol_trend_ok = True
+            sol_trend_filter = os.environ.get("SOL_TREND_FILTER", "true").lower() == "true"
+            if sol_trend_filter and candidates:
+                sol_trend = await check_sol_trend(http)
+                if not sol_trend["ok"]:
+                    sol_trend_ok = False
+                    logger.info(f"SOL trend filter: blocking buys ({sol_trend['reason']})")
+                    await _notify_cycle(f"[FILTER] SOL downtrend detected: {sol_trend['reason']}. Skipping new buys.")
+
+            if candidates and (len(positions) + len(pending)) < req.max_positions and not mc_paused and sol_trend_ok:
                 decisions = await ai_decide_memecoins(candidates, open_mints)
 
             for d in decisions:
@@ -368,8 +481,8 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                         f"reasons={safety['reasons']}"
                     )
                     rugs_blocked += 1
-                    if await send_telegram(http, f"[BLOCKED] {cand['symbol']}: {'; '.join(safety['reasons'])}"):
-                        alerts_sent += 1
+                    await notify_all(http, f"[BLOCKED] {cand['symbol']}: {'; '.join(safety['reasons'])}")
+                    alerts_sent += 1
                     decisions = [
                         {**dd, "action": "SKIP", "reasoning": "rug-check: " + "; ".join(safety["reasons"])}
                         if dd.get("mint") == mint else dd
@@ -405,9 +518,13 @@ async def run_memecoin_cycle(req: MemecoinBotRequest):
                                 "take_profit_usd", "stop_loss_usd", "confidence", "reasoning",
                             )
                         })
-                        label = "PAPER" if req.paper_trading else "LIVE"
-                        if await send_telegram(http, f"[{label} ENTRY] {payload['symbol']} @ ${payload['entry_price_usd']:.8g} | cost ${payload['cost_usd']:.2f}"):
-                            alerts_sent += 1
+                        entry_event = {
+                            "type": "ENTRY", "symbol": payload["symbol"],
+                            "direction": "BUY",
+                            "entry_price_usd": payload["entry_price_usd"],
+                        }
+                        await notify_trade(http, entry_event, "memecoin")
+                        alerts_sent += 1
                     break
 
             balance, positions = await load_memecoin_state(redis, ns)
@@ -464,15 +581,39 @@ async def run_forex_cycle(req: ForexBotRequest):
                 await redis.set(f"{ns}:fx:equity_usd", str(balance))
                 equity = balance
 
+            max_dd_pct = float(os.environ.get("DAILY_MAX_DRAWDOWN_PCT", "3.0"))
+            dd_check = await check_daily_drawdown(redis, ns, max_dd_pct)
+            if dd_check["breached"]:
+                msg = (
+                    f"Forex cycle skipped: daily drawdown limit hit "
+                    f"({dd_check['drawdown_pct']:.1f}% / {max_dd_pct}% max). "
+                    f"P&L today: ${dd_check['daily_pnl']:.2f} across {dd_check['trades_today']} trades."
+                )
+                logger.warning(msg)
+                await notify_all(http, f"[RISK] {msg}")
+                return ForexCycleResponse(
+                    cycle_time=cycle_time, paper_trading=req.paper_trading, approve_first=req.approve_first,
+                    pairs_analyzed=0, signals_generated=0, trades_executed=0, trades_closed=0,
+                    alerts_sent=1, signals=[], open_positions=len(positions),
+                    balance_usd=round(balance or 0, 2), equity_usd=round(equity, 2),
+                    message=msg,
+                )
+
+            pause_state = await is_trading_paused(redis, ns)
+            if pause_state["paused"] and not req.signal_only:
+                logger.warning(f"Equity tracker: {pause_state['reason']}")
+                await notify_all(http, f"[PAUSED] {pause_state['reason']} Switching to signal-only mode.")
+                req = ForexBotRequest(**{**req.model_dump(), "signal_only": True})
+
             approvals = await _process_forex_approvals(http, redis, ns, req, fx_executor)
             balance, equity, positions = await load_forex_state(redis, ns)
 
             closed = await fx_executor.check_exits(req.paper_trading)
             trades_closed = len(closed)
             for c in closed:
-                pnl_str = f"${c['pnl_usd']:+.2f}"
-                if await send_telegram(http, f"[FOREX {c['type']}] {c['pair']} {c['direction']}: {pnl_str}"):
-                    alerts_sent += 1
+                await notify_trade(http, c, "forex")
+                await record_trade_result(redis, ns, c.get("pnl_usd", 0))
+                alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
 
@@ -507,6 +648,21 @@ async def run_forex_cycle(req: ForexBotRequest):
                 if not signal:
                     continue
 
+                news = await check_news_filter(http, pair)
+                if not news["safe"]:
+                    logger.info(f"News filter blocked {pair}: {news['reason']}")
+                    continue
+
+                corr = check_correlation(pair, signal["direction"], {k: v for k, v in positions.items()})
+                if not corr["ok"]:
+                    logger.info(f"Correlation filter: {corr['reason']}")
+                    continue
+
+                session_info = is_good_session_for_pair(pair)
+                if not session_info["optimal"]:
+                    conf = conf * 0.85
+                    signal["session_note"] = session_info["reason"]
+
                 if decision.get("adjusted_sl_pips"):
                     pip_val = get_pip_value(pair)
                     new_sl_pips = _f(decision["adjusted_sl_pips"])
@@ -529,8 +685,8 @@ async def run_forex_cycle(req: ForexBotRequest):
                 signal["reasoning"] = str(decision.get("reasoning", signal.get("reasoning", "")))[:200]
                 signals_out.append(signal)
 
-                if await send_forex_signal(http, signal):
-                    alerts_sent += 1
+                await notify_signal(http, signal)
+                alerts_sent += 1
 
                 if req.signal_only:
                     continue
@@ -549,13 +705,13 @@ async def run_forex_cycle(req: ForexBotRequest):
                     )
                     if position:
                         trades_executed += 1
-                        label = "PAPER" if req.paper_trading else "LIVE"
-                        if await send_telegram(
-                            http,
-                            f"[{label} FOREX ENTRY] {pair} {signal['direction']} @ {signal['entry_price']:.5f} | "
-                            f"SL: {signal['sl_pips']:.0f} pips, TP: {signal['tp_pips']:.0f} pips",
-                        ):
-                            alerts_sent += 1
+                        entry_event = {
+                            "type": "ENTRY", "pair": pair,
+                            "direction": signal["direction"],
+                            "entry_price": signal["entry_price"],
+                        }
+                        await notify_trade(http, entry_event, "forex")
+                        alerts_sent += 1
 
             balance, equity, positions = await load_forex_state(redis, ns)
 
@@ -674,6 +830,16 @@ async def dashboard():
     )
 
 
+@app.get("/analytics")
+async def analytics():
+    """Detailed trading performance analytics: win rate, Sharpe, drawdown, by-pair breakdown."""
+    async with redis_client() as (redis, ns):
+        stats = await calculate_analytics(redis, ns)
+        dd = await check_daily_drawdown(redis, ns)
+        stats["daily_drawdown"] = dd
+    return stats
+
+
 @app.post("/reset", response_model=ResetResponse)
 async def reset(x_control_token: str | None = Header(default=None)):
     """Reset all state (paper balances, positions, logs)."""
@@ -689,8 +855,92 @@ async def reset(x_control_token: str | None = Header(default=None)):
         await redis.set(f"{ns}:mc:balance_usd", "1000")
         await redis.set(f"{ns}:fx:balance_usd", "10000")
         await redis.set(f"{ns}:fx:equity_usd", "10000")
+        await reset_equity_tracker(redis, ns)
 
     return ResetResponse(reset=True, memecoin_balance_usd=1000.0, forex_balance_usd=10000.0)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TELEGRAM COMMAND INTERFACE
+# ══════════════════════════════════════════════════════════════════
+
+async def _handle_telegram_command(http, redis, ns, msg: dict, req) -> None:
+    """Process Telegram text commands from the user."""
+    text = (msg.get("text") or "").strip().lower()
+
+    if text in ("status", "/status", "balance", "/balance"):
+        mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+        fx_bal, _, fx_pos = await load_forex_state(redis, ns)
+        pause = await is_trading_paused(redis, ns)
+        mode = "PAPER" if req.paper_trading else "LIVE"
+        lines = [
+            f"Bot Status ({mode})",
+            f"Memecoin: ${mc_bal or 0:.2f} | {len(mc_pos)} positions",
+            f"Forex: ${fx_bal or 0:.2f} | {len(fx_pos)} positions",
+        ]
+        if pause["paused"]:
+            lines.append(f"PAUSED: {pause['reason']}")
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/positions", "positions", "/pos"):
+        mc_bal, mc_pos = await load_memecoin_state(redis, ns)
+        fx_bal, _, fx_pos = await load_forex_state(redis, ns)
+        lines = ["Open Positions\n"]
+        if fx_pos:
+            lines.append("FOREX:")
+            for pid, p in fx_pos.items():
+                trail = " [TRAILING]" if p.get("trail_active") else ""
+                lines.append(f"  {p['pair']} {p['direction']} @ {p['entry_price']:.5f}{trail}")
+        else:
+            lines.append("FOREX: none")
+        if mc_pos:
+            lines.append("\nMEMECOIN:")
+            for mint, p in mc_pos.items():
+                remaining = p.get("remaining_pct", 100)
+                trail = " [TRAILING]" if p.get("trail_active") else ""
+                rem_str = f" ({remaining:.0f}% remaining)" if remaining < 100 else ""
+                lines.append(f"  {p['symbol']} @ ${p['entry_price_usd']:.8g}{trail}{rem_str}")
+        else:
+            lines.append("\nMEMECOIN: none")
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/analytics", "analytics", "/stats"):
+        stats = await calculate_analytics(redis, ns)
+        dd = await check_daily_drawdown(redis, ns)
+        lines = [
+            "Trading Analytics\n",
+            f"Total trades: {stats['total_trades']}",
+            f"Win rate: {stats.get('win_rate', 0):.1f}%",
+            f"Profit factor: {stats.get('profit_factor', 0):.2f}",
+            f"Sharpe ratio: {stats.get('sharpe_estimate', 0):.2f}",
+            f"Total P&L: ${stats.get('total_pnl', 0):.2f}",
+            f"Max drawdown: ${stats.get('max_drawdown', 0):.2f}",
+            f"Avg win: ${stats.get('avg_win', 0):.2f}",
+            f"Avg loss: ${stats.get('avg_loss', 0):.2f}",
+            f"\nToday: ${dd['daily_pnl']:.2f} ({dd['trades_today']} trades)",
+        ]
+        await send_telegram(http, "\n".join(lines))
+
+    elif text in ("/pause", "pause"):
+        from core.equity_tracker import record_trade_result
+        state = {"consecutive_losses": 99, "consecutive_wins": 0, "paused": True, "recovery_wins": 0}
+        await redis.set(f"{ns}:equity_tracker", json.dumps(state))
+        await send_telegram(http, "Bot PAUSED. Will only send signals, no new trades. Send /resume to restart.")
+
+    elif text in ("/resume", "resume"):
+        await reset_equity_tracker(redis, ns)
+        await send_telegram(http, "Bot RESUMED. Trading is active again.")
+
+    elif text in ("/help", "help"):
+        await send_telegram(http, (
+            "Bot Commands\n\n"
+            "/status - Balances and mode\n"
+            "/positions - All open positions\n"
+            "/analytics - Win rate, P&L, Sharpe\n"
+            "/pause - Stop new trades (signals only)\n"
+            "/resume - Resume trading\n"
+            "/help - This message"
+        ))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -725,17 +975,7 @@ async def _process_memecoin_approvals(http, redis, ns, req, executor) -> int:
         if not cq:
             msg = u.get("message")
             if msg:
-                text = (msg.get("text") or "").strip().lower()
-                if text in ("status", "/status", "balance", "/balance"):
-                    mc_bal, mc_pos = await load_memecoin_state(redis, ns)
-                    fx_bal, _, fx_pos = await load_forex_state(redis, ns)
-                    mode = "PAPER" if req.paper_trading else "LIVE"
-                    lines = [
-                        f"Bot status ({mode})",
-                        f"Memecoin: ${mc_bal or 0:.2f} | {len(mc_pos)} positions",
-                        f"Forex: ${fx_bal or 0:.2f} | {len(fx_pos)} positions",
-                    ]
-                    await send_telegram(http, "\n".join(lines))
+                await _handle_telegram_command(http, redis, ns, msg, req)
             continue
 
         cbid = cq.get("id")
@@ -892,8 +1132,8 @@ async def mt5_webhook(req: MT5SignalRequest):
                         "pair": sig["pair"],
                         "direction": sig["direction"],
                         "entry_price": sig["entry_price"],
-                        "sl": sig["sl"],
-                        "tp": sig["tp"],
+                        "sl": sig["stop_loss"],
+                        "tp": sig["take_profit"],
                         "confidence": sig.get("confidence", 0),
                         "lot_size": float(os.environ.get("FOREX_LOT_SIZE", "0.01")),
                     })
@@ -1011,9 +1251,9 @@ async def trigger_analyze_pair(pair: str, x_control_token: str | None = Header(d
         generator = ForexSignalGenerator(http)
         signal = await generator.analyze_pair(pair, "1h", multi_timeframe=True)
         if signal and signal.get("confidence", 0) > 0:
-            await send_forex_signal(http, signal)
-            return {"pair": pair, "signal": signal, "telegram": "sent"}
-        return {"pair": pair, "signal": signal, "telegram": "no signal met threshold"}
+            sent = await notify_signal(http, signal)
+            return {"pair": pair, "signal": signal, "notifications_sent": sent}
+        return {"pair": pair, "signal": signal, "notifications_sent": 0}
 
 
 # ══════════════════════════════════════════════════════════════════

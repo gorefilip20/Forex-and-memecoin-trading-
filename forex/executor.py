@@ -1,4 +1,8 @@
-"""Forex trade executor: paper trading engine + broker integration (OANDA / MT5 ready)."""
+"""Forex trade executor: paper trading engine + broker integration (OANDA / MT5 ready).
+
+Includes Jev-powered smart exits (early close on momentum loss, trailing stops)
+and dynamic position sizing based on AI confidence.
+"""
 
 import json
 import logging
@@ -20,6 +24,12 @@ logger = logging.getLogger("trading_bot")
 
 OANDA_API_BASE = "https://api-fxtrade.oanda.com"
 OANDA_PRACTICE_BASE = "https://api-fxpractice.oanda.com"
+
+TRAIL_ACTIVATE_RR = 1.0
+TRAIL_STEP_PCT = 0.5
+BREAKEVEN_BUFFER_PIPS = 2.0
+JEV_EXIT_THRESHOLD = 0.65
+JEV_TRAIL_THRESHOLD = 0.55
 
 
 class ForexExecutor:
@@ -49,10 +59,13 @@ class ForexExecutor:
             logger.info(f"Max forex positions reached ({len(positions)})")
             return None
 
+        confidence = _f(signal.get("confidence", 50))
+        adjusted_lot = _scale_lot_size(lot_size, confidence)
+
         position_id = uuid.uuid4().hex[:12]
-        notional = lot_size * 100_000
+        notional = adjusted_lot * 100_000
         margin_required = notional / leverage
-        risk_usd = abs(entry - sl) / pip_val * lot_size * 10
+        risk_usd = abs(entry - sl) / pip_val * adjusted_lot * 10
 
         if paper:
             if balance is None:
@@ -69,15 +82,18 @@ class ForexExecutor:
                 "current_price": entry,
                 "stop_loss": sl,
                 "take_profit": tp,
-                "lot_size": lot_size,
+                "original_sl": sl,
+                "lot_size": adjusted_lot,
                 "leverage": leverage,
                 "margin": round(margin_required, 2),
                 "risk_usd": round(risk_usd, 2),
                 "unrealized_pnl": 0.0,
+                "highest_pnl_pips": 0.0,
                 "paper": True,
                 "opened_at": now_iso(),
-                "confidence": signal.get("confidence", 0),
+                "confidence": confidence,
                 "reasoning": signal.get("reasoning", ""),
+                "trail_active": False,
             }
 
             await self.redis.hset(f"{self.ns}:fx:positions", position_id, json.dumps(position))
@@ -91,17 +107,17 @@ class ForexExecutor:
                 "pair": pair,
                 "direction": direction,
                 "entry_price": entry,
-                "lot_size": lot_size,
+                "lot_size": adjusted_lot,
                 "risk_usd": round(risk_usd, 2),
-                "confidence": signal.get("confidence", 0),
+                "confidence": confidence,
             })
 
             return position
 
-        return await self._execute_broker_order(signal, lot_size, leverage)
+        return await self._execute_broker_order(signal, adjusted_lot, leverage)
 
     async def check_exits(self, paper: bool) -> list[dict]:
-        """Check all open positions for TP/SL hits."""
+        """Check all open positions for TP/SL hits, trailing stops, and Jev smart exits."""
         balance, equity, positions = await load_forex_state(self.redis, self.ns)
         closed = []
 
@@ -116,6 +132,14 @@ class ForexExecutor:
             entry = pos["entry_price"]
             sl = pos["stop_loss"]
             tp = pos["take_profit"]
+            pip_val = get_pip_value(pair)
+
+            if direction == "BUY":
+                pnl_pips = (current - entry) / pip_val
+            else:
+                pnl_pips = (entry - current) / pip_val
+
+            highest = max(pos.get("highest_pnl_pips", 0), pnl_pips)
 
             reason = None
             exit_price = None
@@ -132,19 +156,71 @@ class ForexExecutor:
                     reason, exit_price = "SL_HIT", sl
 
             if reason is None:
-                pip_val = get_pip_value(pair)
-                if direction == "BUY":
-                    pips = (current - entry) / pip_val
-                else:
-                    pips = (entry - current) / pip_val
-                pnl = pips * pos["lot_size"] * 10
+                original_sl = pos.get("original_sl", sl)
+                sl_distance_pips = abs(entry - original_sl) / pip_val
+                rr_achieved = pnl_pips / sl_distance_pips if sl_distance_pips > 0 else 0
+
+                new_sl = sl
+                trail_active = pos.get("trail_active", False)
+
+                if rr_achieved >= TRAIL_ACTIVATE_RR and pnl_pips > 0:
+                    if not trail_active:
+                        if direction == "BUY":
+                            new_sl = entry + BREAKEVEN_BUFFER_PIPS * pip_val
+                        else:
+                            new_sl = entry - BREAKEVEN_BUFFER_PIPS * pip_val
+                        trail_active = True
+                        logger.info(f"Trailing stop activated for {pair}: moved SL to breakeven+{BREAKEVEN_BUFFER_PIPS} pips")
+
+                    trail_distance = highest * TRAIL_STEP_PCT * pip_val
+                    if direction == "BUY":
+                        trail_sl = current - trail_distance
+                        new_sl = max(new_sl, trail_sl)
+                    else:
+                        trail_sl = current + trail_distance
+                        new_sl = min(new_sl, trail_sl)
+
+                if trail_active and new_sl != sl:
+                    pos["stop_loss"] = new_sl
+                    pos["trail_active"] = True
+
+                try:
+                    from ai import ai_check_exit
+                    jev_result = await ai_check_exit(pos, current, "forex")
+
+                    if jev_result["should_exit"] >= JEV_EXIT_THRESHOLD:
+                        reason = "JEV_EXIT"
+                        exit_price = current
+                        logger.info(f"Jev recommends exit for {pair}: prob={jev_result['should_exit']:.0%}")
+
+                    elif jev_result["should_trail"] >= JEV_TRAIL_THRESHOLD and pnl_pips > 0:
+                        if direction == "BUY":
+                            tighter_sl = current - abs(current - entry) * 0.3
+                            if tighter_sl > pos["stop_loss"]:
+                                pos["stop_loss"] = tighter_sl
+                                pos["trail_active"] = True
+                                logger.info(f"Jev tightened SL for {pair} to {tighter_sl:.5f}")
+                        else:
+                            tighter_sl = current + abs(entry - current) * 0.3
+                            if tighter_sl < pos["stop_loss"]:
+                                pos["stop_loss"] = tighter_sl
+                                pos["trail_active"] = True
+                                logger.info(f"Jev tightened SL for {pair} to {tighter_sl:.5f}")
+                except Exception as e:
+                    logger.debug(f"Jev exit check skipped for {pair}: {e}")
+
+            if reason is None:
+                pnl = pnl_pips * pos["lot_size"] * 10
                 pos["current_price"] = current
                 pos["unrealized_pnl"] = round(pnl, 2)
+                pos["highest_pnl_pips"] = highest
                 await self.redis.hset(f"{self.ns}:fx:positions", pos_id, json.dumps(pos))
                 continue
 
+            if not exit_price:
+                exit_price = current
+
             if paper:
-                pip_val = get_pip_value(pair)
                 if direction == "BUY":
                     pips = (exit_price - entry) / pip_val
                 else:
@@ -233,12 +309,15 @@ class ForexExecutor:
                 "entry_price": float(fill.get("price", signal["entry_price"])),
                 "stop_loss": signal["stop_loss"],
                 "take_profit": signal["take_profit"],
+                "original_sl": signal["stop_loss"],
                 "lot_size": lot_size,
                 "leverage": leverage,
                 "paper": False,
                 "broker": "oanda",
                 "broker_trade_id": trade_id,
                 "opened_at": now_iso(),
+                "highest_pnl_pips": 0.0,
+                "trail_active": False,
             }
 
             await self.redis.hset(f"{self.ns}:fx:positions", trade_id, json.dumps(position))
@@ -275,3 +354,14 @@ class ForexExecutor:
         except Exception as e:
             logger.warning(f"OANDA close failed: {e}")
             return 0.0
+
+
+def _scale_lot_size(base_lot: float, confidence: float) -> float:
+    """Scale position size based on AI confidence. Higher confidence = larger position."""
+    if confidence >= 85:
+        return round(base_lot * 1.5, 3)
+    if confidence >= 75:
+        return round(base_lot * 1.25, 3)
+    if confidence >= 65:
+        return base_lot
+    return max(0.001, round(base_lot * 0.75, 3))

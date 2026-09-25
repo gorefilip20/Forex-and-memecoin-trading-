@@ -57,10 +57,14 @@ class ForexSignalGenerator:
         return signals
 
     async def _multi_timeframe_check(self, symbol: str, base_tf: str) -> Optional[dict]:
-        """Check higher timeframe for trend confirmation."""
+        """Check higher timeframe for trend confirmation with rich scoring data."""
         higher_tf_map = {
             "5m": "1h", "15m": "4h", "30m": "4h",
-            "1h": "1d", "4h": "1d",
+            "1h": "4h", "4h": "1d",
+        }
+        top_tf_map = {
+            "5m": "4h", "15m": "1d", "30m": "1d",
+            "1h": "1d",
         }
         higher_tf = higher_tf_map.get(base_tf)
         if not higher_tf:
@@ -72,12 +76,32 @@ class ForexSignalGenerator:
 
         analyzer = TechnicalAnalyzer(candles)
         analysis = analyzer.full_analysis()
-        return {
+
+        mtf = {
             "timeframe": higher_tf,
             "trend": analysis.get("trend", "unknown"),
+            "trend_strength": analysis.get("trend_strength", "unknown"),
             "momentum": analysis.get("momentum", "unknown"),
             "rsi": analysis.get("rsi"),
+            "macd_histogram": analysis.get("macd_histogram"),
+            "atr": analysis.get("atr"),
+            "support": analysis.get("support"),
+            "resistance": analysis.get("resistance"),
         }
+
+        top_tf = top_tf_map.get(base_tf)
+        if top_tf and top_tf != higher_tf:
+            top_candles = await fetch_candles(self.http, symbol, top_tf, 100)
+            if len(top_candles) >= 50:
+                top_analyzer = TechnicalAnalyzer(top_candles)
+                top_analysis = top_analyzer.full_analysis()
+                mtf["top_timeframe"] = top_tf
+                mtf["top_trend"] = top_analysis.get("trend", "unknown")
+                mtf["top_trend_strength"] = top_analysis.get("trend_strength", "unknown")
+                mtf["top_rsi"] = top_analysis.get("rsi")
+                mtf["top_momentum"] = top_analysis.get("momentum", "unknown")
+
+        return mtf
 
     def _evaluate_signal(
         self,
@@ -105,14 +129,35 @@ class ForexSignalGenerator:
 
         if mtf:
             mtf_trend = mtf.get("trend", "unknown")
-            if direction == "BUY" and mtf_trend == "bullish":
+            mtf_strength = mtf.get("trend_strength", "unknown")
+            mtf_momentum = mtf.get("momentum", "unknown")
+
+            aligned = (direction == "BUY" and mtf_trend == "bullish") or \
+                      (direction == "SELL" and mtf_trend == "bearish")
+            opposed = (direction == "BUY" and mtf_trend == "bearish") or \
+                      (direction == "SELL" and mtf_trend == "bullish")
+
+            if aligned:
                 raw_confidence += 0.4
-            elif direction == "SELL" and mtf_trend == "bearish":
-                raw_confidence += 0.4
-            elif direction == "BUY" and mtf_trend == "bearish":
+                if mtf_strength == "strong":
+                    raw_confidence += 0.15
+                if mtf_momentum == mtf_trend:
+                    raw_confidence += 0.1
+            elif opposed:
                 raw_confidence -= 0.5
-            elif direction == "SELL" and mtf_trend == "bullish":
-                raw_confidence -= 0.5
+                if mtf_strength == "strong":
+                    raw_confidence -= 0.15
+
+            top_trend = mtf.get("top_trend")
+            if top_trend:
+                top_aligned = (direction == "BUY" and top_trend == "bullish") or \
+                              (direction == "SELL" and top_trend == "bearish")
+                top_opposed = (direction == "BUY" and top_trend == "bearish") or \
+                              (direction == "SELL" and top_trend == "bullish")
+                if top_aligned:
+                    raw_confidence += 0.25
+                elif top_opposed:
+                    raw_confidence -= 0.3
 
         trend = analysis.get("trend", "unknown")
         if (direction == "BUY" and trend == "bullish") or (direction == "SELL" and trend == "bearish"):
@@ -152,7 +197,9 @@ class ForexSignalGenerator:
         reasoning = f"{direction} signal from {', '.join(reasoning_parts)}. "
         reasoning += f"Trend: {trend} ({strength}). "
         if mtf:
-            reasoning += f"Higher TF ({mtf['timeframe']}): {mtf['trend']}. "
+            reasoning += f"Higher TF ({mtf['timeframe']}): {mtf['trend']} ({mtf.get('trend_strength', '?')}). "
+            if mtf.get("top_timeframe"):
+                reasoning += f"Top TF ({mtf['top_timeframe']}): {mtf.get('top_trend', '?')}. "
         reasoning += f"RSI: {analysis.get('rsi', '?'):.1f}. " if analysis.get("rsi") else ""
         reasoning += f"R:R = 1:{rr:.1f}."
 
