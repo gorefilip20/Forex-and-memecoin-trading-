@@ -16,9 +16,11 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from config.settings import (
@@ -830,6 +832,12 @@ async def dashboard():
     )
 
 
+@app.get("/dashboard/view", response_class=FileResponse)
+async def dashboard_view():
+    """Serve the read-only browser dashboard; execution remains API-controlled."""
+    return FileResponse(Path(__file__).with_name("dashboard.html"), media_type="text/html")
+
+
 @app.get("/analytics")
 async def analytics():
     """Detailed trading performance analytics: win rate, Sharpe, drawdown, by-pair breakdown."""
@@ -848,6 +856,7 @@ async def reset(x_control_token: str | None = Header(default=None)):
         for key_suffix in (
             "mc:balance_usd", "mc:positions", "mc:pending", "mc:cooldowns",
             "fx:balance_usd", "fx:equity_usd", "fx:positions", "fx:pending",
+            "fx:mt5_claims", "fx:mt5_fills",
             "trade_log", "tg_offset",
         ):
             await redis.delete(f"{ns}:{key_suffix}")
@@ -1110,6 +1119,11 @@ class MT5SignalRequest(BaseModel):
     pair: str | None = None
     trade_id: str | None = None
     fill_price: float | None = None
+    mt5_ticket: str | None = None
+    symbol: str | None = None
+    volume: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
 
 @app.post("/mt5/webhook")
@@ -1140,24 +1154,67 @@ async def mt5_webhook(req: MT5SignalRequest):
             return {"signals": available, "open_positions": len(positions)}
 
     elif req.action == "confirm_trade":
-        if os.environ.get("LIVE_TRADING_UNLOCK", "").lower() != "true":
+        if (
+            os.environ.get("LIVE_TRADING_UNLOCK", "").lower() != "true"
+            or os.environ.get("FOREX_LIVE", "").lower() != "true"
+        ):
             return {"error": "live trading is locked"}
         if not req.trade_id:
             return {"error": "trade_id required"}
         async with httpx.AsyncClient(timeout=15) as http:
             async with redis_client() as (redis, ns):
+                # HSETNX is the idempotency gate: retries cannot execute a signal twice.
+                claimed = await redis.hsetnx(
+                    f"{ns}:fx:mt5_claims", req.trade_id, now_iso()
+                )
+                if not claimed:
+                    existing = await redis.hget(f"{ns}:fx:mt5_fills", req.trade_id)
+                    return json.loads(_dec(existing)) if existing else {"error": "trade is already being processed"}
                 raw = await redis.hget(f"{ns}:fx:pending", req.trade_id)
                 if not raw:
+                    await redis.hdel(f"{ns}:fx:mt5_claims", req.trade_id)
                     return {"error": "signal not found or already used"}
                 signal = json.loads(_dec(raw))
-                executor = ForexExecutor(http, redis, ns)
-                lot = float(os.environ.get("FOREX_LOT_SIZE", "0.01"))
-                position = await executor.open_position(signal, lot, paper_trading=False, leverage=100)
+                fill_price = req.fill_price or signal["entry_price"]
+                lot = req.volume or float(os.environ.get("FOREX_LOT_SIZE", "0.01"))
+                ticket = req.mt5_ticket or f"mt5:{req.trade_id}"
+                position = {
+                    "id": ticket,
+                    "pair": signal["pair"],
+                    "symbol": req.symbol or signal["pair"].replace("/", ""),
+                    "direction": signal["direction"],
+                    "entry_price": fill_price,
+                    "current_price": fill_price,
+                    "stop_loss": req.stop_loss or signal["stop_loss"],
+                    "take_profit": req.take_profit or signal["take_profit"],
+                    "original_sl": req.stop_loss or signal["stop_loss"],
+                    "lot_size": lot,
+                    "paper": False,
+                    "broker": "mt5",
+                    "broker_trade_id": ticket,
+                    "opened_at": now_iso(),
+                    "highest_pnl_pips": 0.0,
+                    "trail_active": False,
+                    "signal_id": req.trade_id,
+                }
+                await redis.hset(f"{ns}:fx:positions", ticket, json.dumps(position))
                 await redis.hdel(f"{ns}:fx:pending", req.trade_id)
-                if req.fill_price:
-                    signal["fill_price_mt5"] = req.fill_price
-                await send_telegram(http, f"[MT5] Opened {signal['pair']} {signal['direction']} @ {req.fill_price or signal['entry_price']:.5f}")
-                return {"status": "confirmed", "pair": signal["pair"]}
+                from core.state import log_forex_trade
+                await log_forex_trade(redis, ns, {
+                    "type": "ENTRY", "source": "mt5",
+                    "signal_id": req.trade_id, "broker_trade_id": ticket,
+                    "pair": signal["pair"], "direction": signal["direction"],
+                    "entry_price": fill_price, "lot_size": lot,
+                })
+                result = {
+                    "status": "confirmed",
+                    "pair": signal["pair"],
+                    "ticket": ticket,
+                    "entry_price": fill_price,
+                }
+                await redis.hset(f"{ns}:fx:mt5_fills", req.trade_id, json.dumps(result))
+                await send_telegram(http, f"[MT5] Reconciled {signal['pair']} {signal['direction']} @ {fill_price:.5f}")
+                return result
 
     elif req.action == "get_status":
         async with redis_client() as (redis, ns):
@@ -1169,8 +1226,8 @@ async def mt5_webhook(req: MT5SignalRequest):
                     "pair": p["pair"],
                     "direction": p["direction"],
                     "entry_price": p["entry_price"],
-                    "sl": p["sl"],
-                    "tp": p["tp"],
+                    "sl": p.get("stop_loss"),
+                    "tp": p.get("take_profit"),
                     "unrealized_pnl": p.get("unrealized_pnl", 0),
                 })
             return {"positions": pos_list}

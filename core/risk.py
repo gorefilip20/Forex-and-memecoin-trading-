@@ -49,6 +49,7 @@ PAIR_BEST_SESSIONS = {
 async def check_daily_drawdown(redis, ns: str, max_drawdown_pct: float = 3.0) -> dict:
     """Check if daily P&L has breached the drawdown limit."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    baseline_key = f"{ns}:risk:daily_baseline:{today}"
     raw = await redis.lrange(f"{ns}:trade_log", 0, 499)
 
     daily_pnl = 0.0
@@ -58,7 +59,7 @@ async def check_daily_drawdown(redis, ns: str, max_drawdown_pct: float = 3.0) ->
         if trade.get("type") not in ("TAKE_PROFIT", "STOP_LOSS", "TP_HIT", "SL_HIT", "JEV_EXIT", "TRAIL_STOP", "MANUAL_CLOSE", "LADDER_EXIT"):
             continue
         ts = trade.get("timestamp", trade.get("closed_at", ""))
-        if today not in ts and not ts.startswith(today):
+        if not ts.startswith(today):
             continue
         daily_pnl += _f(trade.get("pnl_usd", 0))
         trade_count += 1
@@ -66,7 +67,12 @@ async def check_daily_drawdown(redis, ns: str, max_drawdown_pct: float = 3.0) ->
     fx_bal = _f(await redis.get(f"{ns}:fx:balance_usd"), 10000)
     mc_bal = _f(await redis.get(f"{ns}:mc:balance_usd"), 1000)
     total_balance = fx_bal + mc_bal
-    drawdown_pct = abs(daily_pnl) / total_balance * 100 if total_balance > 0 and daily_pnl < 0 else 0
+    baseline = _f(await redis.get(baseline_key), 0)
+    if baseline <= 0:
+        baseline = total_balance
+        if baseline > 0:
+            await redis.set(baseline_key, str(round(baseline, 2)))
+    drawdown_pct = abs(daily_pnl) / baseline * 100 if baseline > 0 and daily_pnl < 0 else 0
 
     breached = drawdown_pct >= max_drawdown_pct
     if breached:

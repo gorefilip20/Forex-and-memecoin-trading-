@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -39,6 +40,8 @@ async def load_memecoin_state(redis, ns):
 
 
 async def log_memecoin_trade(redis, ns, entry: dict):
+    entry.setdefault("event_id", uuid.uuid4().hex)
+    entry.setdefault("timestamp", now_iso())
     entry["market"] = "memecoin"
     await redis.lpush(f"{ns}:trade_log", json.dumps(entry))
     await redis.ltrim(f"{ns}:trade_log", 0, 499)
@@ -83,6 +86,8 @@ async def load_forex_state(redis, ns):
 
 
 async def log_forex_trade(redis, ns, entry: dict):
+    entry.setdefault("event_id", uuid.uuid4().hex)
+    entry.setdefault("timestamp", now_iso())
     entry["market"] = "forex"
     await redis.lpush(f"{ns}:trade_log", json.dumps(entry))
     await redis.ltrim(f"{ns}:trade_log", 0, 499)

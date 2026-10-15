@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading Bot Dashboard</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --card:#151d33; --muted:#93a4c5; --text:#f4f7ff; --green:#54d68a; --red:#ff7180; --blue:#78a9ff; }
+    * { box-sizing:border-box; } body { margin:0; font:14px system-ui,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:24px 5vw; border-bottom:1px solid #263452; display:flex; justify-content:space-between; align-items:center; gap:16px; }
+    h1 { margin:0; font-size:24px; } h2 { font-size:16px; margin:0 0 14px; } .muted { color:var(--muted); }
+    main { width:min(1200px,90vw); margin:24px auto; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px; margin-bottom:18px; }
+    .card { background:var(--card); border:1px solid #263452; border-radius:12px; padding:16px; } .value { font-size:25px; font-weight:700; margin-top:8px; }
+    .good { color:var(--green); } .bad { color:var(--red); } .blue { color:var(--blue); } button { background:#294c91; border:0; color:white; padding:9px 13px; border-radius:8px; cursor:pointer; }
+    table { width:100%; border-collapse:collapse; } th,td { padding:10px 8px; border-bottom:1px solid #263452; text-align:left; vertical-align:top; } th { color:var(--muted); font-weight:500; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:20px; background:#24304d; } .empty { color:var(--muted); padding:10px 0; }
+    @media(max-width:640px) { header { align-items:flex-start; flex-direction:column; } th:nth-child(5),td:nth-child(5) { display:none; } }
+  </style>
+</head>
+<body>
+<header><div><h1>Trading Bot Dashboard</h1><div class="muted">Read-only monitoring · execution remains broker/MT5 controlled</div></div><button onclick="load()">Refresh</button></header>
+<main>
+  <div id="error" class="card bad" hidden></div>
+  <section class="grid">
+    <div class="card"><div class="muted">Combined realized P&amp;L</div><div id="pnl" class="value">—</div></div>
+    <div class="card"><div class="muted">Win rate</div><div id="win" class="value">—</div></div>
+    <div class="card"><div class="muted">Closed trades</div><div id="trades" class="value">—</div></div>
+    <div class="card"><div class="muted">MT5 / live gate</div><div id="mode" class="value blue">Read-only</div></div>
+  </section>
+  <section class="grid">
+    <div class="card"><h2>Forex</h2><div id="fx"></div></div>
+    <div class="card"><h2>Memecoins</h2><div id="mc"></div></div>
+  </section>
+  <section class="card"><h2>Open positions</h2><div id="positions" class="empty">Loading…</div></section>
+  <section class="card" style="margin-top:18px"><h2>Recent trade events</h2><div id="events" class="empty">Loading…</div></section>
+</main>
+<script>
+const money = n => `$${Number(n||0).toFixed(2)}`;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+function posRows(items) { if (!items.length) return '<div class="empty">No open positions</div>'; return `<table><thead><tr><th>Market</th><th>Symbol</th><th>Side</th><th>Entry</th><th>SL / TP</th><th>Size</th></tr></thead><tbody>${items.map(p => `<tr><td>${esc(p.broker||p.market||'paper')}</td><td>${esc(p.pair||p.symbol||p.mint)}</td><td><span class="pill ${p.direction==='BUY'?'good':'bad'}">${esc(p.direction||'—')}</span></td><td>${esc(p.entry_price ?? p.entry_price_usd ?? '—')}</td><td>${esc(p.stop_loss ?? p.stop_loss_usd ?? '—')} / ${esc(p.take_profit ?? p.take_profit_usd ?? '—')}</td><td>${esc(p.lot_size ?? p.cost_usd ?? '—')}</td></tr>`).join('')}</tbody></table>`; }
+async function load() { try { const [d,s,a] = await Promise.all([fetch('/dashboard').then(r=>r.json()), fetch('/status').then(r=>r.json()), fetch('/analytics').then(r=>r.json())]); document.getElementById('error').hidden=true; const pnl=Number(d.combined_pnl_usd||0); const pe=document.getElementById('pnl'); pe.textContent=money(pnl); pe.className='value '+(pnl>=0?'good':'bad'); document.getElementById('win').textContent=`${Number(d.win_rate||0).toFixed(1)}%`; document.getElementById('trades').textContent=d.total_trades||0; document.getElementById('fx').innerHTML=`<div class="value">${money(d.forex.equity_usd||d.forex.balance_usd)}</div><div class="muted">Balance ${money(d.forex.balance_usd)} · ${d.forex.open_positions||0} open</div>`; document.getElementById('mc').innerHTML=`<div class="value">${money(d.memecoin.balance_usd)}</div><div class="muted">${d.memecoin.open_positions||0} open</div>`; document.getElementById('positions').innerHTML=posRows([...(s.forex_positions||[]), ...(s.memecoin_positions||[])]); const events=(s.trade_log||[]).slice(0,20); document.getElementById('events').innerHTML=events.length?`<table><thead><tr><th>Time</th><th>Market</th><th>Type</th><th>Symbol</th><th>P&amp;L</th></tr></thead><tbody>${events.map(e=>`<tr><td>${esc(e.timestamp||'—')}</td><td>${esc(e.market||'—')}</td><td>${esc(e.type||'—')}</td><td>${esc(e.pair||e.symbol||e.mint||'—')}</td><td class="${Number(e.pnl_usd||0)>=0?'good':'bad'}">${money(e.pnl_usd)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No events</div>'; } catch(e) { const x=document.getElementById('error'); x.hidden=false; x.textContent='Dashboard unavailable: '+e.message; } }
+load(); setInterval(load,30000);
+</script>
+</body></html>
