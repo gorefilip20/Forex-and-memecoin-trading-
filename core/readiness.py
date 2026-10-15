@@ -25,10 +25,16 @@ def _strong_secret(value: str) -> bool:
 
 def readiness_checks() -> list[Check]:
     live = os.environ.get("FOREX_LIVE", "false").lower() == "true"
+    meme_live = os.environ.get("MEMECOIN_LIVE", "false").lower() == "true"
     auto = os.environ.get("AUTO_TRADE", "false").lower() == "true"
     unlock = os.environ.get("LIVE_TRADING_UNLOCK", "false").lower() == "true"
     acknowledge = os.environ.get("LIVE_RISK_ACK", "false").lower() == "true"
+    meme_ack = os.environ.get("MEMECOIN_LIVE_ACK", "false").lower() == "true"
     practice = os.environ.get("OANDA_PRACTICE", "true").lower() == "true"
+    try:
+        live_slippage = float(os.environ.get("MAX_LIVE_SLIPPAGE_BPS", "0"))
+    except ValueError:
+        live_slippage = float("inf")
     checks = [
         Check("control_secret", _strong_secret(os.environ.get("CONTROL_API_SECRET", "")),
               "CONTROL_API_SECRET must be at least 32 characters with varied characters"),
@@ -44,6 +50,15 @@ def readiness_checks() -> list[Check]:
                   "set LIVE_RISK_ACK=true only after independent demo review"),
             Check("broker_credentials", _present("OANDA_API_KEY") and _present("OANDA_ACCOUNT_ID"),
                   "OANDA_API_KEY and OANDA_ACCOUNT_ID are required for OANDA live mode"),
+        ])
+    if meme_live:
+        checks.extend([
+            Check("memecoin_wallet", _present("SOLANA_PRIVATE_KEY") and _present("SOLANA_WALLET_ADDRESS"),
+                  "SOLANA_PRIVATE_KEY and SOLANA_WALLET_ADDRESS are required for memecoin live mode"),
+            Check("memecoin_ack", meme_ack,
+                  "MEMECOIN_LIVE_ACK=true is required after independent demo review"),
+            Check("memecoin_slippage", 0 < live_slippage <= 300,
+                  "MAX_LIVE_SLIPPAGE_BPS must be set to 300 or less for live mode"),
         ])
     if live and practice:
         checks.append(Check("practice_mode", False,

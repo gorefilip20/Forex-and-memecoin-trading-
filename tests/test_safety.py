@@ -128,3 +128,12 @@ def test_stress_validation_rejects_small_or_cost_fragile_sample():
     assert result.accepted
     result = stress_test([0.1] * 100, extra_cost_per_trade=1.0)
     assert not result.accepted
+
+
+def test_memecoin_live_requires_wallet_ack_and_slippage(monkeypatch):
+    monkeypatch.setenv("MEMECOIN_LIVE", "true")
+    monkeypatch.setenv("MAX_LIVE_SLIPPAGE_BPS", "500")
+    monkeypatch.setenv("MEMECOIN_LIVE_ACK", "false")
+    report = readiness_report()
+    failed = {c["name"] for c in report["checks"] if not c["ok"]}
+    assert {"memecoin_wallet", "memecoin_ack", "memecoin_slippage"} <= failed
