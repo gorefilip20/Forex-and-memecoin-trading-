@@ -46,6 +46,7 @@ from core.notify import notify_all, notify_signal, notify_trade
 from core.risk import check_daily_drawdown, check_correlation, is_good_session_for_pair, calculate_analytics
 from core.news_filter import check_news_filter
 from core.equity_tracker import record_trade_result, is_trading_paused, reset_equity_tracker
+from core.readiness import readiness_report
 from memecoin.discovery import discover_candidates, check_sol_trend
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
@@ -99,6 +100,11 @@ def _enforce_execution_mode(paper_trading: bool) -> None:
             status_code=403,
             detail="live trading is locked; set LIVE_TRADING_UNLOCK=true only after independent review",
         )
+    if not paper_trading:
+        report = readiness_report()
+        if not report["ready"]:
+            failed = [c["name"] for c in report["checks"] if not c["ok"]]
+            raise HTTPException(status_code=503, detail=f"live readiness failed: {', '.join(failed)}")
 
 
 async def _notify_error(msg: str):
@@ -848,6 +854,12 @@ async def analytics():
     return stats
 
 
+@app.get("/readiness")
+async def readiness():
+    """Return non-secret deployment checks; this endpoint never enables trading."""
+    return readiness_report()
+
+
 @app.post("/reset", response_model=ResetResponse)
 async def reset(x_control_token: str | None = Header(default=None)):
     """Reset all state (paper balances, positions, logs)."""
@@ -1154,6 +1166,10 @@ async def mt5_webhook(req: MT5SignalRequest):
             return {"signals": available, "open_positions": len(positions)}
 
     elif req.action == "confirm_trade":
+        report = readiness_report()
+        if not report["ready"]:
+            failed = [c["name"] for c in report["checks"] if not c["ok"]]
+            return {"error": f"live readiness failed: {', '.join(failed)}"}
         if (
             os.environ.get("LIVE_TRADING_UNLOCK", "").lower() != "true"
             or os.environ.get("FOREX_LIVE", "").lower() != "true"

@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from core.risk import check_daily_drawdown
+from core.readiness import readiness_report
 from core.state import log_forex_trade
 
 
@@ -71,3 +72,32 @@ def test_daily_drawdown_ignores_old_loss():
         assert result["daily_pnl"] == 0
         assert result["breached"] is False
     asyncio.run(run())
+
+
+def test_default_configuration_is_not_live(monkeypatch):
+    for key in (
+        "FOREX_LIVE", "MEMECOIN_LIVE", "AUTO_TRADE", "LIVE_TRADING_UNLOCK",
+        "LIVE_RISK_ACK", "OANDA_API_KEY", "OANDA_ACCOUNT_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    report = readiness_report()
+    assert report["live_intent_detected"] is False
+    assert report["ready"] is True  # locked paper mode is safe to run
+    assert any(c["name"] == "paper_default" and c["ok"] for c in report["checks"])
+
+
+def test_live_configuration_requires_explicit_ack_and_approval(monkeypatch):
+    monkeypatch.setenv("FOREX_LIVE", "true")
+    monkeypatch.setenv("AUTO_TRADE", "true")
+    monkeypatch.setenv("LIVE_TRADING_UNLOCK", "true")
+    monkeypatch.setenv("OANDA_PRACTICE", "false")
+    monkeypatch.setenv("CONTROL_API_SECRET", "A" * 40)
+    monkeypatch.setenv("MT5_SECRET", "B" * 40)
+    monkeypatch.setenv("OANDA_API_KEY", "key")
+    monkeypatch.setenv("OANDA_ACCOUNT_ID", "account")
+    monkeypatch.setenv("APPROVE_FIRST", "false")
+    monkeypatch.setenv("DAILY_MAX_DRAWDOWN_PCT", "3")
+    monkeypatch.setenv("LIVE_RISK_ACK", "false")
+    report = readiness_report()
+    failed = {c["name"] for c in report["checks"] if not c["ok"]}
+    assert {"explicit_risk_ack", "approval_gate", "daily_loss_limit"} <= failed
