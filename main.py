@@ -332,7 +332,8 @@ async def _startup_notification():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background trading loops on server boot."""
-    auto_trade = os.environ.get("AUTO_TRADE", "false").lower() == "true"
+    scheduler_enabled = os.environ.get("RUN_SCHEDULER", "false").lower() == "true"
+    auto_trade = scheduler_enabled and os.environ.get("AUTO_TRADE", "false").lower() == "true"
     if auto_trade:
         _scheduler_tasks.append(asyncio.create_task(_auto_memecoin_loop()))
         _scheduler_tasks.append(asyncio.create_task(_auto_forex_loop()))

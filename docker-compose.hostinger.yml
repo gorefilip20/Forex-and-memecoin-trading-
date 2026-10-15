@@ -21,6 +21,8 @@ services:
     build: .
     command: python main.py
     env_file: .env.hostinger
+    environment:
+      RUN_SCHEDULER: "true"
     depends_on:
       redis:
         condition: service_healthy
