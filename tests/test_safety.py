@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from core.risk import check_daily_drawdown
 from core.readiness import readiness_report
 from core.state import log_forex_trade
+from core.risk_gate import size_from_tick_risk, validate_signal
+from core.reconciliation import compare_positions
+from core.validation import stress_test
 
 
 class FakeRedis:
@@ -101,3 +104,27 @@ def test_live_configuration_requires_explicit_ack_and_approval(monkeypatch):
     report = readiness_report()
     failed = {c["name"] for c in report["checks"] if not c["ok"]}
     assert {"explicit_risk_ack", "approval_gate", "daily_loss_limit"} <= failed
+
+
+def test_risk_gate_rejects_bad_stop_and_stale_data():
+    result = validate_signal({"direction": "BUY", "entry_price": 100, "stop_loss": 101, "take_profit": 110}, 1, 2, 120, 60, 0, 1, 0, 3)
+    assert not result.allowed and "BUY" in result.reason
+    result = validate_signal({"direction": "BUY", "entry_price": 100, "stop_loss": 90, "take_profit": 110}, 1, 2, 120, 60, 0, 1, 0, 3)
+    assert not result.allowed and "stale" in result.reason
+
+
+def test_sizing_respects_venue_steps_and_risk_budget():
+    result = size_from_tick_risk(10000, 0.5, 100, 1, 0.01, 10, 0.01)
+    assert result.allowed and result.volume == 0.5
+
+
+def test_reconciliation_fails_closed_on_differences():
+    result = compare_positions({"1": {"direction": "BUY", "entry_price": 1, "stop_loss": .9, "take_profit": 1.2}}, {})
+    assert not result.ok
+
+
+def test_stress_validation_rejects_small_or_cost_fragile_sample():
+    result = stress_test([2.0] * 100, extra_cost_per_trade=1.5)
+    assert result.accepted
+    result = stress_test([0.1] * 100, extra_cost_per_trade=1.0)
+    assert not result.accepted

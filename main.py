@@ -47,6 +47,7 @@ from core.risk import check_daily_drawdown, check_correlation, is_good_session_f
 from core.news_filter import check_news_filter
 from core.equity_tracker import record_trade_result, is_trading_paused, reset_equity_tracker
 from core.readiness import readiness_report
+from core.risk_gate import validate_signal
 from memecoin.discovery import discover_candidates, check_sol_trend
 from memecoin.safety import check_token_safety, enhanced_rug_check
 from memecoin.executor import MemecoinExecutor
@@ -691,6 +692,20 @@ async def run_forex_cycle(req: ForexBotRequest):
 
                 signal["confidence"] = conf
                 signal["reasoning"] = str(decision.get("reasoning", signal.get("reasoning", "")))[:200]
+                risk_gate = validate_signal(
+                    signal,
+                    _f(signal.get("spread_ticks", 0)),
+                    float(os.environ.get("MAX_SPREAD_TICKS", "10")),
+                    _f(signal.get("data_age_seconds", 0)),
+                    float(os.environ.get("MAX_DATA_AGE_SECONDS", "180")),
+                    dd_check["drawdown_pct"],
+                    max_dd_pct,
+                    0.0,
+                    float(os.environ.get("MAX_TOTAL_RISK_PCT", "2")),
+                )
+                if not risk_gate.allowed:
+                    logger.info("Risk gate blocked %s: %s", pair, risk_gate.reason)
+                    continue
                 signals_out.append(signal)
 
                 await notify_signal(http, signal)
